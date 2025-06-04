@@ -624,6 +624,14 @@ class OptLM:
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
 
+        # Event
+        self.load_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_time = 0
+        self.store_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.store_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.store_time = 0
+
         # cache[j][k]
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
@@ -919,12 +927,21 @@ class OptLM:
                     self.load_weight(i, j, k, overlap=False)
 
                 for k in range(self.num_gpu_batches):
+                    self.load_start[j][k].record()
                     self.load_cache(i, j, k, overlap=False)
+                    self.load_end[j][k].record()
                     self.load_hidden(i, j, k)
                     self.compute_layer(i, j, k)
                     self.sync()
                     self.store_hidden(i, j, k)
+                    self.store_start[j][k].record()
                     self.store_cache(i, j, k, overlap=False)
+                    self.store_end[j][k].record()
+                if j > 1:
+                    self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[j - 1], self.store_end[j - 1])])
+                    self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
+            self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[self.num_layers - 1], self.store_end[self.num_layers - 1])])
+            self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
@@ -1244,13 +1261,15 @@ def run_flexgen(args):
     projected = bool(args.debug_mode or cut_gen_len)
 
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    if args.compress_cache:
-        print("FlexGen + INT4")
-    else:
-        print("FlexGen")
+    #if args.compress_cache:
+    #    print("FlexGen + INT4")
+    #else:
+    #    print("FlexGen")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    print("Total: " + str(total_latency) + " Prefill: " + str(prefill_latency) + " Decode: " + str(decode_latency))
+    framework = "FlexGen + INT4" if args.compress_cache else "FlexGen"
+    print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
+          f"Cache time: {(model.load_time + model.store_time) / 1000:.2f} (load {model.load_time / 1000:.2f}, store {model.store_time / 1000:.2f})")
     print("=================================================")
 
 def add_parser_arguments(parser):
