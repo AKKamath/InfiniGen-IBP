@@ -9,6 +9,9 @@ import os
 import pickle
 import time
 from typing import Union, List, Optional
+import math
+import ibp
+import copy
 
 import numpy as np
 from tqdm import tqdm
@@ -26,7 +29,7 @@ from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log)
 
 from infinigen.skewing_controller import weight_bias_concat
-from infinigen.kv_selection_controller import select_kv
+from infinigen.kv_selection_controller import select_kv, select_kv_ibp
 from infinigen.partial_weight_generation_controller import set_partial_cache, set_partial_weight
 
 fix_recursive_import()
@@ -69,6 +72,8 @@ class Policy:
     # Compress KV cache with group-wise quantization
     compress_cache: bool
     comp_cache_config: CompressionConfig
+
+    use_ibp: str
 
     @property
     def w_disk_percent(self):
@@ -357,6 +362,8 @@ class SelfAttention:
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
+        if self.policy.use_ibp == "validate":
+            self.cache_dup = copy.deepcopy(cache_home.val)
         if self.layer_id > 1:
             self.prefetch_kv = device.allocate((2, self.max_num_kv, cache_home.val[0].shape[1], cache_home.val[0].shape[2]), np.float16, pin_memory=True)
 
@@ -381,12 +388,34 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
+        #print("Load", path)
+
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
-            if self.policy.attn_sparsity >= 1.0:
+            if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+                k_val = k_home.data[indices]
+                v_val = v_home.data[indices]
+                device = dst.dev
+                mask_k, mask_v = k_home.mask, v_home.mask
+                bitval_k, bitval_v = k_home.bitval, v_home.bitval
+                bitmask_k, bitmask_v = k_home.bitmask, v_home.bitmask
+                selected_k = ibp.decompress_fetch(k_val.reshape(-1, k_val.shape[2]).view(torch.int64),
+                                                mask_k, bitval_k, bitmask_k, device)
+                selected_v = ibp.decompress_fetch(v_val.reshape(-1, v_val.shape[2]).view(torch.int64),
+                                                mask_v, bitval_v, bitmask_v, device)
+                selected_k = selected_k.view(torch.float16).reshape(self.task.prompt_len + i, k_home.shape[1], k_home.shape[2])
+                selected_v = selected_v.view(torch.float16).reshape(self.task.prompt_len + i, v_home.shape[1], v_home.shape[2])
+                k_c = TorchTensor((self.task.prompt_len + i, k_home.shape[1], k_home.shape[2]), k_home.dtype, selected_k, dst)
+                v_c = TorchTensor((self.task.prompt_len + i, v_home.shape[1], v_home.shape[2]), v_home.dtype, selected_v, dst)
+                cache_read_buf.store((
+                    k_c.smart_copy(dst, indices),
+                    v_c.smart_copy(dst, indices),
+                ))
+
+            elif self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
@@ -426,7 +455,7 @@ class SelfAttention:
             assert self.policy.attn_sparsity >= 1.0
         else:
             raise ValueError(f"Invalid path: {path}")
-    
+
     def prefetch_cache(self, cache_home, cache_read_buf, i, prefetch_idx, prefetch_cache_stream):
         if i == 0:  # prefill, no cache
             return
@@ -454,9 +483,33 @@ class SelfAttention:
                        slice(0, k_home.shape[1]))
 
             if self.policy.attn_sparsity >= 1.0:
-                self.prefetch_kv.data[0, :prefetch_idx.shape[0]], self.prefetch_kv.data[1, :prefetch_idx.shape[0]] = select_kv(prefetch_idx, k_home.data, v_home.data)
-                k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :prefetch_idx.shape[0]], k_home.device)
-                v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :prefetch_idx.shape[0]], v_home.device)
+                if not self.policy.use_ibp:
+                    self.prefetch_kv.data[0, :prefetch_idx.shape[0]], self.prefetch_kv.data[1, :prefetch_idx.shape[0]] = select_kv(prefetch_idx, k_home.data, v_home.data)
+                    k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :prefetch_idx.shape[0]], k_home.device)
+                    v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :prefetch_idx.shape[0]], v_home.device)
+                    #print(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev))
+                    #exit()
+                else:
+                    if self.policy.use_ibp == "validate":
+                        # Get the KV data the old-fashioned way for validation
+                        self.prefetch_kv.data[0, :prefetch_idx.shape[0]], self.prefetch_kv.data[1, :prefetch_idx.shape[0]] = select_kv(prefetch_idx, self.cache_dup[0].data, self.cache_dup[1].data)
+                    if self.policy.use_ibp == "transfer":
+                        masks = None
+                        bitvals = None
+                        bitmasks = None
+                    else:
+                        masks = (k_home.mask, v_home.mask)
+                        bitvals = (k_home.bitval, v_home.bitval)
+                        bitmasks = (k_home.bitmask, v_home.bitmask)
+                    pfetch_k, pfetch_v = select_kv_ibp(prefetch_idx, k_home.data, v_home.data, dst.dev, masks, bitvals, bitmasks)
+                    k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, pfetch_k, dst)
+                    v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, pfetch_v, dst)
+                    if self.policy.use_ibp == "validate":
+                        #print(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), pfetch_k)
+                        torch.testing.assert_close(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), pfetch_k)
+                        torch.testing.assert_close(self.prefetch_kv.data[1, :prefetch_idx.shape[0]].to(dst.dev), pfetch_v)
+                        k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :prefetch_idx.shape[0]], k_home.device)
+                        v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :prefetch_idx.shape[0]], v_home.device)
 
                 with torch.cuda.stream(prefetch_cache_stream):
                     cache_read_buf.store((
@@ -465,7 +518,7 @@ class SelfAttention:
                     ))
         elif path == 1 or path == 2:
             raise ValueError(f"Not implemented path: {path}")
-        else:    
+        else:
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -476,14 +529,44 @@ class SelfAttention:
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
+        k = k_new.data
+        v = v_new.data
         if i == 0:  # prefill
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
+            if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+                # Sample a subset of the k_home
+                sample_stop_index = k.shape[0]
+                k_home.mask, k_home.bitval = ibp.preprocess(k.reshape(k.shape[0] * k.shape[1], -1)[ : sample_stop_index].view(torch.int64), 0.8)
+                v_home.mask, v_home.bitval = ibp.preprocess(v.reshape(v.shape[0] * v.shape[1], -1)[ : sample_stop_index].view(torch.int64), 0.8)
+                k_home.bitmask = torch.zeros(math.ceil(k_home.shape[0] * k_home.shape[1] / 32), device=self.env.gpu.dev, dtype=torch.int32)
+                v_home.bitmask = torch.zeros(math.ceil(v_home.shape[0] * v_home.shape[1] / 32), device=self.env.gpu.dev, dtype=torch.int32)
         else:  # decoding
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
+        if self.policy.use_ibp == "validate":
+            general_copy(self.cache_dup[0], indices, k_new, None)
+            general_copy(self.cache_dup[1], indices, v_new, None)
+        if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+            if 'pos' in locals():
+                start = (pos - k.shape[0]) * k.shape[1] // 32
+                end = k.shape[0] * k.shape[1] // 32
+            else:
+                start = 0
+                end = k.shape[0] * k.shape[1] // 32
+            k2 = k.reshape(-1, k.shape[2]).view(torch.int64)
+            v2 = v.reshape(-1, v.shape[2]).view(torch.int64)
+            k_home.bitmask[start:start + end] = ibp.compress_inplace(k2, k_home.mask, k_home.bitval)
+            v_home.bitmask[start:start + end] = ibp.compress_inplace(v2, v_home.mask, v_home.bitval)
+            k_new.data = k2.view(torch.float16).reshape(k.shape)
+            v_new.data = v2.view(torch.float16).reshape(v.shape)
 
+            #if self.policy.use_ibp == "validate":
+            #    test = ibp.decompress_fetch(k.reshape(-1, k.shape[2]).view(torch.int64), k_home.mask, k_home.bitval, k_home.bitmask[start:start + end])
+            #    torch.testing.assert_close(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), test)
+
+            #print("comp bitmask", k_home.bitmask[start:start + end])
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
@@ -717,13 +800,22 @@ class OptLM:
         # CUDA streams [j][k]
         self.prefetch_cache_stream = torch.cuda.Stream()
 
-        # Event (To start self attention after prefetching)
-        self.prefetch_evt = torch.cuda.Event()
-
         # Intermediate tensors
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+
+        # Event (To start self attention after prefetching)
+        self.prefetch_evt = torch.cuda.Event()
+        self.prefetch_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.prefetch_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.store_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.store_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.prefetch_time = 0
+        self.load_time = 0
+        self.store_time = 0
 
         # cache[j][k]
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
@@ -801,7 +893,7 @@ class OptLM:
         else:
             if j not in self.attn_layer[2:]:
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
-    
+
     def prefetch_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if i == 0:  # prefill, no cache
@@ -817,7 +909,7 @@ class OptLM:
 
         prefetch_idx = self.layers[j].prefetch_idx
         next_attn = self.attn_layer[self.attn_layer.index(j) + 1]
-
+        #print("prefetch", prefetch_idx)
         # Load from cache_home to cache_read_buf
         self.layers[next_attn].prefetch_cache(self.cache_home[next_attn][k], self.cache_read_buf[next_attn][k], i, prefetch_idx, self.prefetch_cache_stream)
 
@@ -1062,17 +1154,30 @@ class OptLM:
                     self.load_weight(i, j, k, overlap=False)
 
                 for k in range(self.num_gpu_batches):
+                    self.load_start[j][k].record()
                     self.load_cache(i, j, k, overlap=False)
+                    self.load_end[j][k].record()
                     self.load_hidden(i, j, k)
                     if (j in self.attn_layer[1:-1]) and (i > 0):
                         self.sync()
                     self.compute_layer(i, j, k)
                     self.sync()
                     self.store_hidden(i, j, k)
+                    self.store_start[j][k].record()
                     self.store_cache(i, j, k, overlap=False)
+                    self.store_end[j][k].record()
+                    self.prefetch_start[j][k].record()
                     if j in self.attn_layer[1:-1] and (i > 0):
                         self.prefetch_cache(i, j, k, overlap=True)
                         self.prefetch_evt.record()
+                    self.prefetch_end[j][k].record()
+                if j > 1:
+                    self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[j - 1], self.prefetch_end[j - 1])])
+                    self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
+                    self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[j - 1], self.store_end[j - 1])])
+            self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[self.num_layers - 1], self.prefetch_end[self.num_layers - 1])])
+            self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
+            self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[self.num_layers - 1], self.store_end[self.num_layers - 1])])
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
@@ -1355,7 +1460,8 @@ def run_flexgen(args):
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+                                      group_dim=2, symmetric=False),
+                    args.ibp)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
@@ -1375,6 +1481,14 @@ def run_flexgen(args):
     finally:
         env.close_copy_threads()
 
+    if 0:
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        show_str = "Outputs:\n" + 70 * '-' + "\n"
+        for i in [0, len(outputs)-1]:
+            show_str += f"{i}: {outputs[i]}\n"
+            show_str += "-" * 70 + "\n"
+        print(show_str)
+
     # Log output
     prefill_latency = costs[0]
     prefill_throughput = num_prompts * prompt_len / prefill_latency
@@ -1392,10 +1506,15 @@ def run_flexgen(args):
     projected = bool(args.debug_mode or cut_gen_len)
 
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    print("InfiniGen (Ours)")
+    if args.ibp:
+        print(f"InfiniGen + IBP ({args.ibp})")
+    else:
+        print("InfiniGen")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    print("Total: " + str(total_latency) + " Prefill: " + str(prefill_latency) + " Decode: " + str(decode_latency))
+    framework = "InfiniGen + IBP" if args.ibp else "InfiniGen"
+    print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
+          f"Cache time: {(model.load_time + model.store_time + model.prefetch_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f} prefetch: {model.prefetch_time / 1000:.2f})")
     print("=================================================")
 
 def add_parser_arguments(parser):
@@ -1445,7 +1564,8 @@ def add_parser_arguments(parser):
     parser.add_argument("--alpha", type=int, default=4)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
-    
+    parser.add_argument("--ibp", type=str, default="")
+
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)
 

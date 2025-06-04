@@ -953,4 +953,3 @@ def copy_worker_func(queue, cuda_id):
                 dst_data.copy_(src_data)
 
             queue.task_done()
-                                            

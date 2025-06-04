@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
-
+import math
+import ibp
 
 def select_kv(prefetch_idx, k_cache, v_cache):
     """Selects and aggregates critical KV caches using speculated indices
@@ -22,8 +23,55 @@ def select_kv(prefetch_idx, k_cache, v_cache):
     ind = prefetch_idx * k_cache.shape[1] + torch.arange(k_cache.shape[1])[None, :]
     selected_k = F.embedding(ind, k_cache.reshape(-1, k_cache.shape[2]))
     selected_v = F.embedding(ind, v_cache.reshape(-1, v_cache.shape[2]))
+    #print("select", selected_k[0], k_cache[ind.reshape(-1)[0]])
     return selected_k, selected_v
 
+def select_kv_ibp(prefetch_idx, k_cache, v_cache, device, masks = None, bitvals = None, bitmasks = None):
+    """Selects and aggregates critical KV caches using speculated indices.
+
+    Uses IBP to perform the copying and decompression.
+
+    On the decoding stage, aggregates the critical KV caches corresponding to
+    the speculated prefetch index using embedding function.
+
+    Args:
+        prefetch_idx: Indices of critical KV cache tokens for each head and batch (n', 1, bh)
+        k_cache: Key cache (n, bh, d)
+        v_cache: Value cache (n, bh, d)
+
+    Returns:
+        selected_k: selected key cache (n', bh, d)
+        selected_v: selected value cache (n', bh, d)
+    """
+    shape0 = prefetch_idx.shape[0]
+    prefetch_idx = prefetch_idx.squeeze()#.to(k_cache.device)
+    ind = prefetch_idx * k_cache.shape[1] + torch.arange(k_cache.shape[1], device=device, dtype=torch.int64)[None, :]
+
+    if masks is not None:
+        mask_k = masks[0]
+        mask_v = masks[1]
+        bitval_k = bitvals[0]
+        bitval_v = bitvals[1]
+        bitmask_k = bitmasks[0]
+        bitmask_v = bitmasks[1]
+    else:
+        empty_var = torch.zeros(k_cache.shape[2] // 4, device=device, dtype=torch.int64)
+        bitmask = torch.zeros(math.ceil(k_cache.reshape(-1, k_cache.shape[2]).shape[0] / 32), device=device, dtype=torch.int32)
+        mask_k = empty_var
+        mask_v = empty_var
+        bitval_k = empty_var
+        bitval_v = empty_var
+        bitmask_k = bitmask
+        bitmask_v = bitmask
+
+    selected_k = ibp.decompress_fetch(k_cache.reshape(-1, k_cache.shape[2]).view(torch.int64),
+                                      mask_k, bitval_k, bitmask_k, device, index_arr=ind.reshape(-1))
+    selected_v = ibp.decompress_fetch(v_cache.reshape(-1, v_cache.shape[2]).view(torch.int64),
+                                      mask_v, bitval_v, bitmask_v, device, index_arr=ind.reshape(-1))
+    selected_k = selected_k.view(torch.float16).reshape(shape0, k_cache.shape[1], k_cache.shape[2])
+    selected_v = selected_v.view(torch.float16).reshape(shape0, v_cache.shape[1], v_cache.shape[2])
+    #print("select", bitmask_k[ind.reshape(-1)[0] // 32] & (1 << (ind.reshape(-1)[0] % 32)), selected_k[0], k_cache[ind.reshape(-1)[0] // k_cache.shape[1]])
+    return selected_k, selected_v
 
 def speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv):
     """Speculates the indices of the critical KV caches of next attention layer.
