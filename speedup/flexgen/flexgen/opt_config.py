@@ -49,6 +49,44 @@ class OptConfig:
         return batch_size * seq_len * self.input_dim * 2
 
 
+@dataclasses.dataclass(frozen=True)
+class GemmaConfig:
+    name: str = "gemma-7b"
+    num_hidden_layers: int = 28
+    max_seq_len: int = 8192
+    hidden_size: int = 3072
+    n_head: int = 16
+    n_head_kv: int = 16
+    input_dim: int = 3072
+    ffn_embed_dim: int = 3072
+    pad: int = 1
+    activation_fn: str = 'gelu'
+    vocab_size: int = 256000
+    layer_norm_eps: float = 0.000001
+    pad_token_id: int = 0
+    dtype: type = np.float16
+    prompt_len: int = 0  # The length of the prompt
+    head_dim: int = 256  # The dimension of each attention head
+    intermediate_size: int = 24576
+
+    def model_bytes(self):
+        h = self.input_dim
+        return 	2 * (self.num_hidden_layers * (
+        # self-attention
+        h * (3 * h + 1) + h * (h + 1) +
+        # mlp
+        h * (4 * h + 1) + h * 4 * (h + 1) +
+        # layer norm
+        h * 4) +
+        # embedding
+        self.vocab_size * (h + 1))
+
+    def cache_bytes(self, batch_size, seq_len):
+        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
+
+    def hidden_bytes(self, batch_size, seq_len):
+        return batch_size * seq_len * self.input_dim * 2
+
 def get_opt_config(name, **kwargs):
     if "/" in name:
         name = name.split("/")[1]
@@ -119,6 +157,11 @@ def get_opt_config(name, **kwargs):
             max_seq_len=2048, num_hidden_layers=24, n_head=96,
             hidden_size=12288, input_dim=12288, ffn_embed_dim=12288 * 4,
         )
+    elif arch_name == "gemma-7b-pytorch":
+        config = GemmaConfig(name=name,
+            max_seq_len=8192, num_hidden_layers=28, n_head=16, n_head_kv=16,
+            hidden_size=3072, input_dim=3072, ffn_embed_dim=3072 * 4,
+        )
     else:
         raise ValueError(f"Invalid model name: {name}")
 
@@ -128,7 +171,7 @@ def get_opt_config(name, **kwargs):
 def download_opt_weights_old(model_name, path):
     """Download weights from huggingface."""
     import torch
-    from transformers import OPTForCausalLM, BloomForCausalLM
+    from transformers import OPTForCausalLM, BloomForCausalLM, AutoModelForCausalLM
 
     if "/" in model_name:
         model_name = model_name.split("/")[1].lower()
@@ -143,6 +186,10 @@ def download_opt_weights_old(model_name, path):
         model_class = BloomForCausalLM
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
+    elif "gemma" in model_name:
+        hf_model_name = "google/" + model_name
+        model_class = AutoModelForCausalLM
+        disable_hf_opt_init()
     else:
         raise ValueError("Invalid model name: {model_name}")
 
@@ -217,7 +264,7 @@ def disable_hf_opt_init():
 
 
 def download_opt_weights(model_name, path):
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download, login
     import torch
 
     print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
@@ -229,9 +276,16 @@ def download_opt_weights(model_name, path):
         hf_model_name = "facebook/" + model_name
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
+    elif "gemma" in model_name:
+        hf_model_name = "google/" + model_name
 
-    folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    #login(token=os.getenv("HUGGINGFACE_TOKEN", None))
+    print(f"Downloading {hf_model_name} from huggingface hub...")
+    folder = snapshot_download(hf_model_name, allow_patterns=["*.bin", "*.ckpt"])
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
+    if len(bin_files) == 0:
+        # Let's try to find ckpt files
+        bin_files = glob.glob(os.path.join(folder, "*.ckpt"))
 
     if "/" in model_name:
         model_name = model_name.split("/")[1].lower()
@@ -240,12 +294,19 @@ def download_opt_weights(model_name, path):
     os.makedirs(path, exist_ok=True)
 
     for bin_file in tqdm(bin_files, desc="Convert format"):
-        state = torch.load(bin_file)
+        state: dict = torch.load(bin_file)
+        # GEMMA is stored as a dict within a dict
+        if len(state) == 1:
+            state = list(state.values())[0]
         for name, param in tqdm(state.items(), leave=False):
             name = name.replace("model.", "")
             name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
             param_path = os.path.join(path, name)
+            #print(name, param, flush=True)
             with open(param_path, "wb") as f:
+                # Numpy does not support bfloat16
+                if param.dtype == torch.bfloat16:
+                    param = param.to(torch.float16)
                 np.save(f, param.cpu().detach().numpy())
 
             # shared embedding

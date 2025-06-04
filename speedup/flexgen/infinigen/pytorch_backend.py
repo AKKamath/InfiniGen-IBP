@@ -288,13 +288,26 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
+    def gemma_input_embed(self, inputs, w_token, pad_token_id, donate):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        token_ids = inputs.data
+        if donate[0]: inputs.delete()
+
+        # token embedding
+        token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+        data = token_embed
+        return TorchTensor.create_from_torch(data, self)
+
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
-        pin_memory = False
+        pin_memory = True
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
@@ -602,6 +615,20 @@ class TorchDevice:
         out = F.linear(out, wo.data, bias=bo.data)
 
         out.add_(inputs.data)
+        if donate[0]: inputs.delete()
+        return TorchTensor.create_from_torch(out, self)
+
+    def gemma_mlp(self, inputs, w_gate, w_up, w_down, donate):
+        if w_gate.device.device_type == DeviceType.COMPRESSED:
+            w_gate = w_gate.device.decompress(w_gate)
+            w_up = w_up.device.decompress(w_up)
+            w_down = w_down.device.decompress(w_down)
+
+        gate = F.linear(inputs.data, w_gate.data)
+        gate = F.gelu(gate, approximate="tanh")
+        up = F.linear(inputs.data, w_up.data)
+        fuse = gate * up
+        out = F.linear(fuse, w_down.data)
         if donate[0]: inputs.delete()
         return TorchTensor.create_from_torch(out, self)
 
@@ -926,3 +953,4 @@ def copy_worker_func(queue, cuda_id):
                 dst_data.copy_(src_data)
 
             queue.task_done()
+                                            
