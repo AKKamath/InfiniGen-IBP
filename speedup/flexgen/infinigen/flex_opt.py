@@ -534,7 +534,7 @@ class SelfAttention:
         if i == 0:  # prefill
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
-            if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+            if self.policy.use_ibp:
                 # Sample a subset of the k_home
                 sample_stop_index = k.shape[0]
                 k_home.mask, k_home.bitval = ibp.preprocess(k.reshape(k.shape[0] * k.shape[1], -1)[ : sample_stop_index].view(torch.int64), 0.8)

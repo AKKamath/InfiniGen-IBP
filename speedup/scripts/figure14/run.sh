@@ -15,7 +15,7 @@ do
 done
 '
 FLEXGEN_PATH=$PWD/../../flexgen
-for SCHEME in "ibp_compress" #"ibp" "ibp_compress" "infinigen" #"ibp_validate" "ibp_compress" "ibp" "original" #"int4" "h2o" 
+for SCHEME in "infinigen" #"ibp" "ibp_compress" #"infinigen" #"ibp" "ibp_compress" "infinigen" #"ibp_validate" "ibp_compress" "ibp" "original" #"int4" "h2o" 
 do
   rm $FLEXGEN_PATH/flexgen/flex_opt.py
   rm $FLEXGEN_PATH/flexgen/flex_gemma.py
@@ -24,7 +24,7 @@ do
   then
     ln -s ../original/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
     ln -s ../original/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
-  elif [ "$SCHEME" = "ibp" ] || [ "$SCHEME" = "ibp_compress" ] || [ "$SCHEME" = "ibp_validate" ]
+  elif [ "$SCHEME" = "ibp" ] || [ "$SCHEME" = "ibp_compress" ] || [ "$SCHEME" = "ibp_validate" ] || [ "$SCHEME" = "infinigen" ]
   then
     ln -s ../infinigen/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
     ln -s ../infinigen/flex_gemma.py $FLEXGEN_PATH/flexgen/flex_gemma.py
@@ -34,8 +34,9 @@ do
     ln -s ../$SCHEME/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
   fi
 
-  MODEL="google/gemma-7b-pytorch"
   TYPE="flex_gemma"
+  MODEL="google/gemma-7b-pytorch"
+  #TYPE="flex_opt"
   #MODEL="facebook/opt-6.7b"
 
   CMD="--model ${MODEL} --percent 100 0 0 100 0 100 --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
