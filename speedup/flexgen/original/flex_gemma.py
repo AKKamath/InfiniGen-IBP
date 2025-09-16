@@ -9,9 +9,6 @@ import os
 import pickle
 import time
 from typing import Union, List, Optional
-import math
-import ibp
-import copy
 
 import numpy as np
 from tqdm import tqdm
@@ -21,16 +18,12 @@ from transformers import AutoTokenizer
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import, TorchTensor)
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
-
-from infinigen.skewing_controller import weight_bias_concat
-from infinigen.kv_selection_controller import select_kv, select_kv_ibp
-from infinigen.partial_weight_generation_controller import set_partial_cache, set_partial_weight
 
 fix_recursive_import()
 
@@ -72,8 +65,6 @@ class Policy:
     # Compress KV cache with group-wise quantization
     compress_cache: bool
     comp_cache_config: CompressionConfig
-
-    use_ibp: str
 
     @property
     def w_disk_percent(self):
@@ -208,6 +199,7 @@ def init_weight_list(weight_specs, policy, env):
         ret.append(weight)
     return ret
 
+
 class InputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -235,7 +227,7 @@ class InputEmbed:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_token = weight_home.val[0]
+        w_token = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst)))
@@ -257,14 +249,16 @@ class InputEmbed:
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_token, donate[2]) = weight_read_buf.pop()
+            (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
-            (w_token, _) = weight_read_buf.val
+            (w_token, _), (w_pos, _) = weight_read_buf.val
 
-        h = self.compute.gemma_input_embed(h, w_token, self.config.pad_token_id, donate)
+        h = self.compute.opt_input_embed(h, mask,
+            w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
 
 
@@ -276,13 +270,8 @@ class OutputEmbed:
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
-        self.sampler = Sampler(self.config.vocab_size)
+
         self.task = None
-        batch_size = self.policy.gpu_batch_size
-        self.temperatures = torch.FloatTensor([1] * batch_size).to(self.compute.dev)
-        self.top_ps = torch.FloatTensor([0.95] * batch_size).to(self.compute.dev)
-        self.top_ks = torch.LongTensor([64] * batch_size).to(self.compute.dev)
-        self.decode_output_positions = torch.tensor(0, dtype=torch.int64).to(self.compute.dev)
 
     def set_task(self, task):
         self.task = task
@@ -293,20 +282,23 @@ class OutputEmbed:
         path = os.path.join(path, "")
         weight_specs = [
             # w_ln
-            ((h,), dtype, path + "norm.weight"),
+            ((h,), dtype, path + "decoder.layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "decoder.layer_norm.bias"),
             # w_token
-            ((v, h), dtype, path + "embedder.weight"),
+            ((v, h), dtype, path + "decoder.embed_tokens.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_ln, w_token = weight_home.val
+        w_ln, b_ln, w_token = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
-            weight_read_buf.store((w_ln.smart_copy(dst2), w_token.smart_copy(dst1)))
+            weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
+                w_token.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -327,24 +319,17 @@ class OutputEmbed:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_ln, donate[1]), (w_token, donate[3]) = weight_read_buf.pop()
+            (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
         else:
-            (w_ln, _), (w_token, _) = weight_read_buf.val
+            (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        if i == 0:
-            # Prefill phase
-            output_positions = torch.LongTensor([self.task.prompt_len - 1]).to(self.compute.dev)
-        else:
-            # Decoding phase
-            output_positions = self.decode_output_positions
-
-        h = self.compute.gemma_output_embed(h, w_ln, w_token, donate,
-                         self.sampler, output_positions, self.temperatures, self.top_ps, self.top_ks)
+        h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+            self.task.do_sample, self.task.temperature)
         hidden.val = h
 
 
 class SelfAttention:
-    def __init__(self, config, env, policy, layer_id, freq_cis, enable_prefetching, partial_weight_ratio=0.2, alpha=4, max_num_kv=400):
+    def __init__(self, config, env, policy, layer_id):
         self.config = config
         self.env = env
         self.layer_id = layer_id
@@ -355,53 +340,50 @@ class SelfAttention:
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
 
-        self.freq_cis = freq_cis
-        self.num_heads = config.n_head
-        self.num_kv_heads = config.n_head_kv
-        self.head_dim = config.head_dim
-        assert self.num_heads % self.num_kv_heads == 0
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-
         self.task = None
-        self.enable_prefetching = enable_prefetching
-        self.prefetch_idx = None
-        self.prefetch_kv = None
-        self.partial_index = None
-        self.alpha = alpha
-        self.max_num_kv = max_num_kv
-        if self.layer_id > 1:
-            self.partial_weight_ratio = partial_weight_ratio
-        else:
-            self.partial_weight_ratio = None
 
     def set_task(self, task):
         self.task = task
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
-
-        path = os.path.join(os.path.join(path, f"layers.{self.layer_id}"))
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
         weight_specs = [
-            # w_qkv, Q (num_heads) + K (num_kv_heads) + V (num_kv_heads)
-            (((self.num_heads + 2 * self.num_kv_heads) * self.head_dim, h), dtype, path + ".self_attn.qkv_proj.weight"),
+            # w_q
+            ((h, h), dtype, path + ".q_proj.weight"),
+            # b_q
+            ((h,), dtype, path + ".q_proj.bias"),
+            # w_k
+            ((h, h), dtype, path + ".k_proj.weight"),
+            # b_k
+            ((h,), dtype, path + ".k_proj.bias"),
+            # w_v
+            ((h, h), dtype, path + ".v_proj.weight"),
+            # b_v
+            ((h,), dtype, path + ".v_proj.bias"),
             # w_out
-            ((h, self.num_heads * self.head_dim), dtype, path + ".self_attn.o_proj.weight"),
+            ((h, h), dtype, path + ".out_proj.weight"),
+            # b_out
+            ((h,), dtype, path + ".out_proj.bias"),
             # w_ln
-            ((h,), dtype, path + ".input_layernorm.weight"),
+            ((h,), dtype, path + "_layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "_layer_norm.bias"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        w_qkv, w_out, w_ln = weight_home.val
+        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
-                w_qkv.smart_copy(dst1), w_out.smart_copy(dst1),
-                w_ln.smart_copy(dst2)))
+                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
+                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
+                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
+                w_out.smart_copy(dst1), b_out.smart_copy(dst2),
+                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -419,11 +401,6 @@ class SelfAttention:
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
-        if self.policy.use_ibp == "validate":
-            self.cache_dup = copy.deepcopy(cache_home.val)
-        if self.layer_id > 1:
-            #self.prefetch_kv = device.allocate((2, self.max_num_kv, cache_home.val[0].shape[1], cache_home.val[0].shape[2]), np.float16, pin_memory=True)
-            self.prefetch_kv = device.allocate((2, self.task.prompt_len + self.task.gen_len, cache_home.val[0].shape[1], cache_home.val[0].shape[2]), np.float16, pin_memory=True)
 
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
@@ -451,27 +428,7 @@ class SelfAttention:
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
-            if self.policy.use_ibp:
-                k_val = k_home.data[indices]
-                v_val = v_home.data[indices]
-                device = dst.dev
-                mask_k, mask_v = k_home.mask, v_home.mask
-                bitval_k, bitval_v = k_home.bitval, v_home.bitval
-                bitmask_k, bitmask_v = k_home.bitmask, v_home.bitmask
-                selected_k = ibp.decompress_fetch(k_val.reshape(-1, k_val.shape[2]).view(torch.int64),
-                                                mask_k, bitval_k, bitmask_k, device)
-                selected_v = ibp.decompress_fetch(v_val.reshape(-1, v_val.shape[2]).view(torch.int64),
-                                                mask_v, bitval_v, bitmask_v, device)
-                selected_k = selected_k.view(torch.float16).reshape(self.task.prompt_len + i, k_home.shape[1], k_home.shape[2])
-                selected_v = selected_v.view(torch.float16).reshape(self.task.prompt_len + i, v_home.shape[1], v_home.shape[2])
-                k_c = TorchTensor((self.task.prompt_len + i, k_home.shape[1], k_home.shape[2]), k_home.dtype, selected_k, dst)
-                v_c = TorchTensor((self.task.prompt_len + i, v_home.shape[1], v_home.shape[2]), v_home.dtype, selected_v, dst)
-                cache_read_buf.store((
-                    k_c.smart_copy(dst, indices),
-                    v_c.smart_copy(dst, indices),
-                ))
-
-            elif self.policy.attn_sparsity >= 1.0:
+            if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
@@ -512,71 +469,6 @@ class SelfAttention:
         else:
             raise ValueError(f"Invalid path: {path}")
 
-    def prefetch_cache(self, cache_home, cache_read_buf, i, prefetch_idx, prefetch_cache_stream):
-        if i == 0:  # prefill, no cache
-            return
-
-        k_home, v_home = cache_home.val
-
-        # Pick code path
-        if self.policy.compress_cache:
-            path = 0
-            dst = self.attention_compute.compressed_device
-        else:
-            if self.policy.cpu_cache_compute:
-                if (k_home.device.device_type == DeviceType.MIXED and
-                    k_home.data[0][0] is not None):
-                    path = 2
-                else:
-                    path = 1
-            else:
-                path = 0
-            dst = self.attention_compute
-
-        if path == 0:  # Direct copy
-            # shape: (s, b * n_head, head_dim)
-            indices = (slice(0, prefetch_idx.shape[0]),
-                       slice(0, k_home.shape[1]))
-
-            if self.policy.attn_sparsity >= 1.0:
-                if not self.policy.use_ibp:
-                    self.prefetch_kv.data[0, :prefetch_idx.shape[0]], self.prefetch_kv.data[1, :prefetch_idx.shape[0]] = select_kv(prefetch_idx, k_home.data, v_home.data)
-                    k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :prefetch_idx.shape[0]], k_home.device)
-                    v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :prefetch_idx.shape[0]], v_home.device)
-                    #print(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev))
-                    #exit()
-                else:
-                    if self.policy.use_ibp == "validate":
-                        # Get the KV data the old-fashioned way for validation
-                        self.prefetch_kv.data[0, :prefetch_idx.shape[0]], self.prefetch_kv.data[1, :prefetch_idx.shape[0]] = select_kv(prefetch_idx, self.cache_dup[0].data, self.cache_dup[1].data)
-                    if self.policy.use_ibp == "transfer":
-                        masks = None
-                        bitvals = None
-                        bitmasks = None
-                    else:
-                        masks = (k_home.mask, v_home.mask)
-                        bitvals = (k_home.bitval, v_home.bitval)
-                        bitmasks = (k_home.bitmask, v_home.bitmask)
-                    pfetch_k, pfetch_v = select_kv_ibp(prefetch_idx, k_home.data, v_home.data, dst.dev, masks, bitvals, bitmasks)
-                    k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, pfetch_k, dst)
-                    v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, pfetch_v, dst)
-                    if self.policy.use_ibp == "validate":
-                        #print(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), pfetch_k)
-                        torch.testing.assert_close(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), pfetch_k)
-                        torch.testing.assert_close(self.prefetch_kv.data[1, :prefetch_idx.shape[0]].to(dst.dev), pfetch_v)
-                        k_c = TorchTensor((prefetch_idx.shape[0], k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :prefetch_idx.shape[0]], k_home.device)
-                        v_c = TorchTensor((prefetch_idx.shape[0], v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :prefetch_idx.shape[0]], v_home.device)
-
-                with torch.cuda.stream(prefetch_cache_stream):
-                    cache_read_buf.store((
-                        k_c.smart_copy(dst, indices),
-                        v_c.smart_copy(dst, indices),
-                    ))
-        elif path == 1 or path == 2:
-            raise ValueError(f"Not implemented path: {path}")
-        else:
-            raise ValueError(f"Invalid path: {path}")
-
     def store_cache(self, cache_home, cache_write_buf, i):
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
@@ -585,104 +477,53 @@ class SelfAttention:
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
-        k = k_new.data
-        v = v_new.data
         if i == 0:  # prefill
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
-            if self.policy.use_ibp:
-                # Sample a subset of the k_home
-                sample_stop_index = k.shape[0]
-                k_home.mask, k_home.bitval = ibp.preprocess(k.reshape(k.shape[0] * k.shape[1], -1)[ : sample_stop_index].view(torch.int64), 0.8)
-                v_home.mask, v_home.bitval = ibp.preprocess(v.reshape(v.shape[0] * v.shape[1], -1)[ : sample_stop_index].view(torch.int64), 0.8)
-                k_home.bitmask = torch.zeros(math.ceil(k_home.shape[0] * k_home.shape[1] / 32), device=self.env.gpu.dev, dtype=torch.int32)
-                v_home.bitmask = torch.zeros(math.ceil(v_home.shape[0] * v_home.shape[1] / 32), device=self.env.gpu.dev, dtype=torch.int32)
         else:  # decoding
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
-        if self.policy.use_ibp == "validate":
-            general_copy(self.cache_dup[0], indices, k_new, None)
-            general_copy(self.cache_dup[1], indices, v_new, None)
-        if self.policy.use_ibp and self.policy.use_ibp != "transfer":
-            if 'pos' in locals():
-                start = (pos - k.shape[0]) * k.shape[1] // 32
-                end = k.shape[0] * k.shape[1] // 32
-            else:
-                start = 0
-                end = k.shape[0] * k.shape[1] // 32
-            k2 = k.reshape(-1, k.shape[2]).view(torch.int64)
-            v2 = v.reshape(-1, v.shape[2]).view(torch.int64)
-            k_home.bitmask[start:start + end] = ibp.compress_inplace(k2, k_home.mask, k_home.bitval)
-            v_home.bitmask[start:start + end] = ibp.compress_inplace(v2, v_home.mask, v_home.bitval)
-            k_new.data = k2.view(torch.float16).reshape(k.shape)
-            v_new.data = v2.view(torch.float16).reshape(v.shape)
 
-            #if self.policy.use_ibp == "validate":
-            #    test = ibp.decompress_fetch(k.reshape(-1, k.shape[2]).view(torch.int64), k_home.mask, k_home.bitval, k_home.bitmask[start:start + end])
-            #    torch.testing.assert_close(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), test)
-
-            #print("comp bitmask", k_home.bitmask[start:start + end])
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
-    def forward(self, hidden,
-                cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, warmup, partial_weight_read_buf, partial_cache_read_buf,
-                speculation_stream, prev_partial_cache_read_buf, prev_partial_weight_read_buf, weight_home):
+    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+                cache_write_buf, i, k):
+        n_head = self.config.n_head
+
         donate = [False] * 14
         h, donate[0] = hidden.val, True
-        head_dim = self.head_dim
-        n_head = self.num_heads
-        n_head_kv = self.num_kv_heads
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            ((w_qkv, donate[2]), (w_out, donate[8]), (w_ln, donate[10])) = weight_read_buf.pop()
+            ((w_q, donate[2]), (b_q, donate[3]), (w_k, donate[4]), (b_k, donate[5]),
+             (w_v, donate[6]), (b_v, donate[7]), (w_out, donate[8]), (b_out, donate[9]),
+             (w_ln, donate[10]), (b_ln, donate[11])) = weight_read_buf.pop()
         else:
-            ((w_qkv, _), (w_out, _), (w_ln, _)) = weight_read_buf.val
-
-        if self.enable_prefetching and (i > 0):
-            p_w_q = partial_weight_read_buf.val
+            ((w_q, _), (b_q, _), (w_k, _), (b_k, _),
+             (w_v, _), (b_v, _), (w_out, _), (b_out, _),
+             (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
-            #mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            mask_tensor = torch.full((1, 1, self.task.prompt_len, self.task.prompt_len), -2.3819763e38).to(torch.float)
-            mask_tensor = torch.triu(mask_tensor, diagonal=1).to(self.compute.dev)
-            curr_mask_tensor = mask_tensor.index_select(2, torch.arange(0, self.task.prompt_len, dtype=torch.int64).to(self.compute.dev))
-            h_new, new_k_cache, new_v_cache, w_qkv, self.partial_index, self.skew = self.compute.gemma_mha(h, curr_mask_tensor, w_qkv, w_out, w_ln, self.freq_cis[:self.task.prompt_len],
-                n_head, n_head_kv, head_dim, donate, self.policy.compress_cache, self.policy.comp_cache_config, warmup, self.partial_weight_ratio)
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
+                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            if (prev_partial_cache_read_buf is not None) and (not warmup):
-                prev_partial_cache_read_buf.store(set_partial_cache(new_k_cache.data, self.partial_index, n_head, head_dim))
-                prev_partial_weight_read_buf.store(set_partial_weight(w_qkv.data, self.partial_index, n_head, head_dim))
-            if warmup:
-                weight_home.val[0] = w_qkv.smart_copy(weight_home.val[0].device)[0]
         else:  # decoding
-            #mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            #print("freq_cis", self.freq_cis.shape, self.freq_cis[self.task.prompt_len + i - 1], self.task.prompt_len)
-            #mask_tensor = torch.full((1, 1, self.task.prompt_len + i, self.task.prompt_len + i), -2.3819763e38).to(torch.float)
-            #mask_tensor = torch.triu(mask_tensor, diagonal=1)
-            #curr_mask_tensor = mask_tensor[:, :, self.task.prompt_len + i - 1].to(self.compute.dev)
-            #curr_mask_tensor = None
+            mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-            if self.enable_prefetching:
-                partial_k_cache = partial_cache_read_buf.val
-            if self.enable_prefetching:
-                h_new, new_k_cache, new_v_cache, self.prefetch_idx = self.compute.gemma_mha_gen(self.skew, h, self.task.prompt_len + i - 1, w_qkv, w_out, w_ln, self.freq_cis[self.task.prompt_len + i - 1],
-                    n_head, n_head_kv, head_dim, k_cache, v_cache, donate, self.policy.attn_sparsity,
-                    self.policy.compress_cache, self.policy.comp_cache_config, p_w_q, partial_k_cache, speculation_stream, self.alpha, self.max_num_kv)
-            else:
-                h_new, new_k_cache, new_v_cache, _ = self.compute.gemma_mha_gen(self.skew, h, self.task.prompt_len + i - 1, w_qkv, w_out, w_ln, self.freq_cis[self.task.prompt_len + i - 1],
-                    n_head, n_head_kv, head_dim, k_cache, v_cache, donate, self.policy.attn_sparsity,
-                    self.policy.compress_cache, self.policy.comp_cache_config, None, None, None, None, None)
+            h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
+                b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
+                k_cache, v_cache, donate, self.policy.attn_sparsity,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            if (prev_partial_cache_read_buf is not None) and (self.layer_id > 1):
-                prev_partial_cache_read_buf.val = torch.cat((prev_partial_cache_read_buf.val, set_partial_cache(new_k_cache.data, self.partial_index, n_head, head_dim)))
-        hidden.val = h_new
+
+        hidden.val = h
 
 
 class MLP:
@@ -695,8 +536,6 @@ class MLP:
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
 
-        self.intermed_size = config.intermediate_size
-
         self.task = None
 
     def set_task(self, task):
@@ -704,30 +543,33 @@ class MLP:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
-        path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
+        path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
         weight_specs = [
-            # gate_proj
-            ((self.intermed_size, h), dtype, path + "mlp.gate_proj.weight"),
-            # up_proj
-            ((self.intermed_size, h), dtype, path + "mlp.up_proj.weight"),
-            # down_proj
-            ((h, self.intermed_size), dtype, path + "mlp.down_proj.weight"),
-            # w_pln
-            ((h,), dtype, path + "post_attention_layernorm.weight"),
+            # wi
+            ((4 * h, h), dtype, path + "fc1.weight"),
+            # bi
+            ((4 * h,), dtype, path + "fc1.bias"),
+            # wo
+            ((h, 4 * h), dtype, path + "fc2.weight"),
+            # bo
+            ((h,), dtype, path + "fc2.bias"),
+            # w_ln
+            ((h,), dtype, path + "final_layer_norm.weight"),
+            # b_ln
+            ((h,), dtype, path + "final_layer_norm.bias"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        gate_proj, up_proj, down_proj, w_pln = weight_home.val
+        wi, bi, wo, bo, w_ln, b_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((
-                gate_proj.smart_copy(dst1),
-                up_proj.smart_copy(dst1),
-                down_proj.smart_copy(dst1),
-                w_pln.smart_copy(dst2)))
+                wi.smart_copy(dst1), bi.smart_copy(dst2),
+                wo.smart_copy(dst1), bo.smart_copy(dst2),
+                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -748,11 +590,13 @@ class MLP:
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            ((gate_proj, donate[1]), (up_proj, donate[2]), (down_proj, donate[3]), (w_pln, donate[4])) = weight_read_buf.pop()
+            ((wi, donate[1]), (bi, donate[2]), (wo, donate[3]), (bo, donate[4]),
+             (w_ln, donate[5]), (b_ln, donate[6])) = weight_read_buf.pop()
         else:
-            ((gate_proj, _), (up_proj, _), (down_proj, _), (w_pln, _)) = weight_read_buf.val
+            ((wi, _), (bi, _), (wo, _), (bo, _),
+             (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
-        h = self.compute.gemma_mlp(h, gate_proj, up_proj, down_proj, w_pln, donate)
+        h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
         hidden.val = h
 
 
@@ -802,16 +646,12 @@ class TransformerLayer:
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
 
-class GemmaLM:
+class OptLM:
     def __init__(self,
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
                  path: str,
-                 policy: Policy,
-                 partial_weight_ratio,
-                 alpha,
-                 max_num_kv
-                 ):
+                 policy: Policy):
         if isinstance(config, str):
             config = get_opt_config(config)
         self.config = config
@@ -819,22 +659,15 @@ class GemmaLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.freq_cis = precompute_freqs_cis(self.config.head_dim, self.config.max_seq_len * 2, theta=10_000).to(env.gpu.dev)
 
         layers = []
-        self.attn_layer = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
             if policy.sep_layer:
-                if (i == 0) or (i == (self.config.num_hidden_layers - 1)):
-                    layers.append(SelfAttention(self.config, self.env, self.policy, i, self.freq_cis, False, partial_weight_ratio, alpha, max_num_kv))
-                else:
-                    layers.append(SelfAttention(self.config, self.env, self.policy, i, self.freq_cis, True, partial_weight_ratio, alpha, max_num_kv))
-                self.attn_layer.append(len(layers) - 1)
+                layers.append(SelfAttention(self.config, self.env, self.policy, i))
                 layers.append(MLP(self.config, self.env, self.policy, i))
             else:
                 layers.append(TransformerLayer(self.config, self.env, self.policy, i))
-                self.attn_layer.append(len(layers) - 1)
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
@@ -852,35 +685,26 @@ class GemmaLM:
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
         self.store_cache_stream = torch.cuda.Stream()
-        self.speculation_stream = torch.cuda.Stream()
-        # CUDA streams [j][k]
-        self.prefetch_cache_stream = torch.cuda.Stream()
 
         # Intermediate tensors
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
 
-        # Event (To start self attention after prefetching)
-        self.prefetch_evt = torch.cuda.Event()
-        self.prefetch_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
-        self.prefetch_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        # Event
         self.load_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
         self.load_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_time = 0
         self.store_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
         self.store_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
-        self.prefetch_time = 0
-        self.load_time = 0
         self.store_time = 0
 
         # cache[j][k]
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.partial_cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
         # weight[j]
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
-        self.partial_weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
@@ -895,7 +719,7 @@ class GemmaLM:
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
             os.path.join(self.path, f"{self.config.name}-np")))
-        check_path = os.path.join(expanded_path, "embedder.weight")
+        check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             download_opt_weights(self.config.name, self.path)
 
@@ -944,29 +768,9 @@ class GemmaLM:
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
-                if j not in self.attn_layer[2:]:
-                    self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
-        else:
-            if j not in self.attn_layer[2:]:
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
-
-    def prefetch_cache(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if i == 0:  # prefill, no cache
-            return
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
-
-        prefetch_idx = self.layers[j].prefetch_idx
-        next_attn = self.attn_layer[self.attn_layer.index(j) + 1]
-        # Load from cache_home to cache_read_buf
-        self.layers[next_attn].prefetch_cache(self.cache_home[next_attn][k], self.cache_read_buf[next_attn][k], i, prefetch_idx, self.prefetch_cache_stream)
+        else:
+            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -1049,7 +853,6 @@ class GemmaLM:
                 self.output_ids[left:right, pos:pos+1] = ids
         else:  # move to home
             x = self.hidden[i][j][k]
-
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
 
@@ -1058,24 +861,9 @@ class GemmaLM:
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-        if isinstance(self.layers[j], SelfAttention) or isinstance(self.layers[j], TransformerLayer):
-            if k==0: # Generate skewing matrix for first input of warmup
-                warmup_state = (not k) and self.warmup
-                if j in self.attn_layer[2:]:
-                    prev_attn = self.attn_layer[self.attn_layer.index(j) - 1]
-                    self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-                        self.weight_read_buf[j], self.attention_mask[k],
-                        self.cache_write_buf[j][k], i, k, warmup_state, self.partial_weight_read_buf[j], self.partial_cache_read_buf[j][k], self.speculation_stream,
-                        self.partial_cache_read_buf[prev_attn][k], self.partial_weight_read_buf[prev_attn], self.weight_home[j])
-                else:
-                    self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-                        self.weight_read_buf[j], self.attention_mask[k],
-                        self.cache_write_buf[j][k], i, k, warmup_state, self.partial_weight_read_buf[j], self.partial_cache_read_buf[j][k], self.speculation_stream,
-                        None, None, self.weight_home[j])
-        else:
-            self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-                self.weight_read_buf[j], self.attention_mask[k],
-                self.cache_write_buf[j][k], i, k)
+        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -1117,8 +905,7 @@ class GemmaLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0,
-                 warmup: bool = False):
+                 verbose: int = 0):
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1134,7 +921,6 @@ class GemmaLM:
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
-        self.warmup = warmup
 
         # Output token ids
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
@@ -1152,10 +938,8 @@ class GemmaLM:
                 self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
-                self.partial_cache_read_buf[j][k].clear()
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
-            self.partial_weight_read_buf[j].clear()
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
@@ -1202,7 +986,6 @@ class GemmaLM:
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
-            print("gen_len: ", i)
             timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
@@ -1215,26 +998,17 @@ class GemmaLM:
                     self.load_cache(i, j, k, overlap=False)
                     self.load_end[j][k].record()
                     self.load_hidden(i, j, k)
-                    if (j in self.attn_layer[1:-1]) and (i > 0):
-                        self.sync()
                     self.compute_layer(i, j, k)
                     self.sync()
                     self.store_hidden(i, j, k)
                     self.store_start[j][k].record()
                     self.store_cache(i, j, k, overlap=False)
                     self.store_end[j][k].record()
-                    self.prefetch_start[j][k].record()
-                    if j in self.attn_layer[1:-1] and (i > 0):
-                        self.prefetch_cache(i, j, k, overlap=True)
-                        self.prefetch_evt.record()
-                    self.prefetch_end[j][k].record()
                 if j > 1:
-                    self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[j - 1], self.prefetch_end[j - 1])])
-                    self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
                     self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[j - 1], self.store_end[j - 1])])
-            self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[self.num_layers - 1], self.prefetch_end[self.num_layers - 1])])
-            self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
+                    self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
             self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[self.num_layers - 1], self.store_end[self.num_layers - 1])])
+            self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
@@ -1492,8 +1266,6 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path):
 def run_flexgen(args):
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    elif args.model == "google/gemma-7b-pytorch":
-        tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b-pytorch", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
@@ -1519,19 +1291,17 @@ def run_flexgen(args):
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False),
-                    args.ibp)
+                                      group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
 
     opt_config = get_opt_config(args.model)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
-    model = GemmaLM(opt_config, env, args.path, policy, args.partial_weight_ratio, args.alpha, args.max_num_kv)
+    model = OptLM(opt_config, env, args.path, policy)
 
     try:
         output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
         timers("generate").reset()
         output_ids = model.generate(
@@ -1540,15 +1310,6 @@ def run_flexgen(args):
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
-
-    if 1:
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0]:
-            show_str += f"{i} Prompt: {' '.join(outputs[i].split()[:prompt_len])}\n"
-            show_str += f"{i} Output: {' '.join(outputs[i].split()[prompt_len:])}\n"
-            show_str += "-" * 70 + "\n"
-        print(show_str)
 
     # Log output
     prefill_latency = costs[0]
@@ -1567,15 +1328,15 @@ def run_flexgen(args):
     projected = bool(args.debug_mode or cut_gen_len)
 
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    if args.ibp:
-        print(f"InfiniGen + IBP ({args.ibp})")
-    else:
-        print("InfiniGen")
+    #if args.compress_cache:
+    #    print("FlexGen + INT4")
+    #else:
+    #    print("FlexGen")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    framework = "InfiniGen + IBP" if args.ibp else "InfiniGen"
+    framework = "FlexGen + INT4" if args.compress_cache else "FlexGen"
     print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
-          f"Cache time: {(model.load_time + model.store_time + model.prefetch_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f} prefetch: {model.prefetch_time / 1000:.2f})")
+          f"Cache time: {(model.load_time + model.store_time) / 1000:.2f} (load {model.load_time / 1000:.2f}, store {model.store_time / 1000:.2f})")
     print("=================================================")
 
 def add_parser_arguments(parser):
@@ -1621,11 +1382,6 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
-
-    parser.add_argument("--alpha", type=int, default=4)
-    parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
-    parser.add_argument("--max-num-kv", type=int, default=400)
-    parser.add_argument("--ibp", type=str, default="")
 
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)

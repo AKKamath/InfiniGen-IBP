@@ -264,7 +264,7 @@ def disable_hf_opt_init():
 
 
 def download_opt_weights(model_name, path):
-    from huggingface_hub import snapshot_download, login
+    from huggingface_hub import snapshot_download
     import torch
 
     print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
@@ -280,8 +280,8 @@ def download_opt_weights(model_name, path):
         hf_model_name = "google/" + model_name
 
     #login(token=os.getenv("HUGGINGFACE_TOKEN", None))
-    print(f"Downloading {hf_model_name} from huggingface hub...")
-    folder = snapshot_download(hf_model_name, allow_patterns=["*.bin", "*.ckpt"])
+    folder = snapshot_download(hf_model_name)
+    print(f"Downloaded {hf_model_name} from huggingface hub at {folder}.")
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
     if len(bin_files) == 0:
         # Let's try to find ckpt files

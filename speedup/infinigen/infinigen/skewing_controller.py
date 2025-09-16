@@ -82,3 +82,57 @@ def skew(query, key, wq, wk, n_head, head_dim):
         wq[start:end, :] = A.t() @ wq[start:end]
         wk[start:end, :] = A.t() @ wk[start:end]
     return wq, wk
+
+def gen_skewing_qk(query, key, n_head, head_dim):
+    """
+    Generate the skewing matrix use later.
+    Args:
+        query: Query matrix (b, n, h, d)
+        key: Key matrix (b, n, h, d)
+        n_head: Number of heads which we refer to as h
+        head_dim: Hidden dimension of each head which we refer to as d
+
+    Returns:
+        skew: Skewing matrix (h, d, d)
+    """
+    skew = torch.zeros(n_head, head_dim, head_dim).to(query.device).to(torch.float16)
+    for h_idx in range(n_head):
+        _, sq, vq = torch.svd(query[0, :, h_idx].to(torch.float))
+        _, sk, _ = torch.svd(key[0, :, h_idx].to(torch.float))
+        sq = sq.to(torch.float16)
+        vq = vq.to(torch.float16)
+        sk = sk.to(torch.float16)
+        sq = sq * sk
+        A = torch.zeros(head_dim, head_dim).to(query.device).to(torch.float16)
+        _, ind = sq.sort()
+        A = A.scatter(-1, ind.unsqueeze(0).repeat(head_dim, 1), vq)
+        skew[h_idx] = A
+    return skew
+
+
+def skew_qk(query, key, skew, n_head, head_dim):
+    """Manipulates the query/key vectors directly on-the-fly. By doing so, a few columns of
+    the query and key matrix have become much more important. We use
+    the columns for attention speculation.
+
+    Args:
+        query: Query matrix (b, n, h, d)
+        key: Key matrix (b, n, h, d)
+        skew: Skewing matrix (h, d, d)
+        n_head: Number of heads which we refer to as h
+        head_dim: Hidden dimension of each head which we refer to as d
+
+    Returns:
+        _q: Manipulated query (b, n, h, d)
+        _k: Manipulated key (b, n, h, d)
+    """
+
+    q_shaped = query.reshape([-1, query.shape[2], query.shape[3]])
+    k_shaped = key.reshape([-1, key.shape[2], key.shape[3]])
+    print(skew.shape, query.shape, key.shape, flush=True)
+    for h_idx in range(n_head):
+        A = skew[h_idx]
+        query[:, :, h_idx, :] = (q_shaped[:, h_idx, :] @ A).reshape([query.shape[0], query.shape[1], -1])
+        key[:, :, h_idx, :] = (k_shaped[:, h_idx, :] @ A).reshape([key.shape[0], key.shape[1], -1])
+    print("after ", query.shape, key.shape, flush=True)
+    return query, key
