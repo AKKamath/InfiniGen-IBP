@@ -14,52 +14,69 @@ do
   rm allocate.so
 done
 '
+
+#TYPE="flex_gemma"
+#MODEL="google/gemma-7b-pytorch"
+TYPE="flex_opt"
+MODEL_LIST=("facebook/opt-2.7b" "facebook/opt-6.7b" "facebook/opt-13b" "facebook/opt-30b")
+
 FLEXGEN_PATH=$PWD/../../flexgen
-for SCHEME in "infinigen" #"ibp" "ibp_compress" #"infinigen" #"ibp" "ibp_compress" "infinigen" #"ibp_validate" "ibp_compress" "ibp" "original" #"int4" "h2o" 
+for MODEL in ${MODEL_LIST[@]}
 do
-  rm $FLEXGEN_PATH/flexgen/flex_opt.py
-  rm $FLEXGEN_PATH/flexgen/flex_gemma.py
-  rm $FLEXGEN_PATH/flexgen/pytorch_backend.py
-  if [ "$SCHEME" = "int4" ]
-  then
-    ln -s ../original/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
-    ln -s ../original/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
-  elif [ "$SCHEME" = "ibp" ] || [ "$SCHEME" = "ibp_compress" ] || [ "$SCHEME" = "ibp_validate" ] || [ "$SCHEME" = "infinigen" ]
-  then
-    ln -s ../infinigen/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
-    ln -s ../infinigen/flex_gemma.py $FLEXGEN_PATH/flexgen/flex_gemma.py
-    ln -s ../infinigen/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
-  else
-    ln -s ../$SCHEME/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
-    ln -s ../$SCHEME/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
-  fi
+  for SCHEME in "infinigen" "ibp_compress" #"original" "flex-ibp" # #"ibp" "ibp_compress" #"infinigen" #"ibp" "ibp_compress" "infinigen"
+  do
+    rm $FLEXGEN_PATH/flexgen/flex_opt.py
+    rm $FLEXGEN_PATH/flexgen/flex_gemma.py
+    rm $FLEXGEN_PATH/flexgen/pytorch_backend.py
+    if [ "$SCHEME" = "int4" ]
+    then
+      ln -s ../original/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
+      ln -s ../original/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
+    elif [ "$SCHEME" = "ibp" ] || [ "$SCHEME" = "ibp_compress" ] || [ "$SCHEME" = "ibp_validate" ] || [ "$SCHEME" = "infinigen" ]
+    then
+      ln -s ../infinigen/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
+      ln -s ../infinigen/flex_gemma.py $FLEXGEN_PATH/flexgen/flex_gemma.py
+      ln -s ../infinigen/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
+    elif [ "$SCHEME" = "flex-ibp" ]
+    then
+      ln -s ../original/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
+      ln -s ../original/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
+    else
+      ln -s ../$SCHEME/flex_opt.py $FLEXGEN_PATH/flexgen/flex_opt.py
+      ln -s ../$SCHEME/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
+    fi
 
-  TYPE="flex_gemma"
-  MODEL="google/gemma-7b-pytorch"
-  #TYPE="flex_opt"
-  #MODEL="facebook/opt-6.7b"
-
-  CMD="--model ${MODEL} --percent 100 0 0 100 0 100 --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
-  if [ "$SCHEME" = "int4" ]
-  then
-    CMD=$CMD" --compress-cache"
-  elif [ "$SCHEME" = "h2o" ]
-  then
-    CMD=$CMD" --max-num-kv 415 --hh-ratio 0.1 --hh-all"
-  elif [ "$SCHEME" = "infinigen" ]
-  then
-    CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400"
-  elif [ "$SCHEME" = "ibp_compress" ]
-  then
-    CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=compress"
-  elif [ "$SCHEME" = "ibp_validate" ]
-  then
-    CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=validate"
-  elif [ "$SCHEME" = "ibp" ]
-  then
-    CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=transfer"
-  fi
-  echo "python -m flexgen.${TYPE} ${CMD}"
-  python -m flexgen.${TYPE} $CMD
-  sleep 10
+    CMD="--model ${MODEL} --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
+    if [ "$MODEL" = "facebook/opt-30b" ]
+    then
+      CMD=$CMD" --percent 70 30 0 100 100 0"
+    else
+      CMD=$CMD" --percent 100 0 0 100 100 0"
+    fi
+    if [ "$SCHEME" = "int4" ]
+    then
+      CMD=$CMD" --compress-cache"
+    elif [ "$SCHEME" = "h2o" ]
+    then
+      CMD=$CMD" --max-num-kv 415 --hh-ratio 0.1 --hh-all"
+    elif [ "$SCHEME" = "infinigen" ]
+    then
+      CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400"
+    elif [ "$SCHEME" = "ibp_compress" ]
+    then
+      CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=compress"
+    elif [ "$SCHEME" = "ibp_validate" ]
+    then
+      CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=validate"
+    elif [ "$SCHEME" = "ibp" ]
+    then
+      CMD=$CMD" --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 400 --ibp=transfer"
+    elif [ "$SCHEME" = "flex-ibp" ]
+    then
+      CMD=$CMD" --ibp=compress"
+    fi
+    echo "python -m flexgen.${TYPE} ${CMD}"
+    python -m flexgen.${TYPE} $CMD
+    sleep 10
+  done
 done

@@ -1481,11 +1481,13 @@ def run_flexgen(args):
     finally:
         env.close_copy_threads()
 
-    if 0:
+    if 1:
+        prompts = tokenizer.batch_decode(inputs, skip_special_tokens=True)
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0, len(outputs)-1]:
-            show_str += f"{i}: {outputs[i]}\n"
+        for i in [0]:
+            show_str += f"Prompt: {' '.join(prompts[i].split())}\n"
+            show_str += f"Output: {' '.join(outputs[i][len(prompts[i]):].split())}\n"
             show_str += "-" * 70 + "\n"
         print(show_str)
 
@@ -1513,7 +1515,7 @@ def run_flexgen(args):
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     framework = "InfiniGen + IBP" if args.ibp else "InfiniGen"
-    print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
+    print(f"{framework}: Model: {args.model} Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
           f"Cache time: {(model.load_time + model.store_time + model.prefetch_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f} prefetch: {model.prefetch_time / 1000:.2f})")
     print("=================================================")
 

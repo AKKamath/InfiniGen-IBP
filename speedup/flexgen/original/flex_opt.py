@@ -10,6 +10,10 @@ import pickle
 import time
 from typing import Union, List, Optional
 
+import math
+import ibp
+import copy
+
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -18,7 +22,7 @@ from transformers import AutoTokenizer
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import, TorchTensor)
 from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -65,6 +69,8 @@ class Policy:
     # Compress KV cache with group-wise quantization
     compress_cache: bool
     comp_cache_config: CompressionConfig
+
+    use_ibp: str
 
     @property
     def w_disk_percent(self):
@@ -335,6 +341,10 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
+        if self.policy.use_ibp == "validate":
+            self.cache_dup = copy.deepcopy(cache_home.val)
+
+
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
             return
@@ -361,7 +371,26 @@ class SelfAttention:
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
-            if self.policy.attn_sparsity >= 1.0:
+            if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+                k_val = k_home.data[indices]
+                v_val = v_home.data[indices]
+                device = dst.dev
+                mask_k, mask_v = k_home.mask, v_home.mask
+                bitval_k, bitval_v = k_home.bitval, v_home.bitval
+                bitmask_k, bitmask_v = k_home.bitmask, v_home.bitmask
+                selected_k = ibp.decompress_fetch(k_val.reshape(-1, k_val.shape[1] * k_val.shape[2]).view(torch.int64),
+                                                mask_k, bitval_k, bitmask_k, device)
+                selected_v = ibp.decompress_fetch(v_val.reshape(-1, v_val.shape[1] * v_val.shape[2]).view(torch.int64),
+                                                mask_v, bitval_v, bitmask_v, device)
+                selected_k = selected_k.view(torch.float16).reshape(self.task.prompt_len + i, k_home.shape[1], k_home.shape[2])
+                selected_v = selected_v.view(torch.float16).reshape(self.task.prompt_len + i, v_home.shape[1], v_home.shape[2])
+                k_c = TorchTensor((self.task.prompt_len + i, k_home.shape[1], k_home.shape[2]), k_home.dtype, selected_k, dst)
+                v_c = TorchTensor((self.task.prompt_len + i, v_home.shape[1], v_home.shape[2]), v_home.dtype, selected_v, dst)
+                cache_read_buf.store((
+                    k_c.smart_copy(dst, indices),
+                    v_c.smart_copy(dst, indices),
+                ))
+            elif self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
@@ -410,13 +439,42 @@ class SelfAttention:
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
+        k = k_new.data
+        v = v_new.data
+
         if i == 0:  # prefill
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
+            if self.policy.use_ibp:
+                # Sample a subset of the k_home
+                sample_stop_index = k.shape[0]
+                k_home.mask, k_home.bitval = ibp.preprocess(k.reshape(k.shape[0], -1)[ : sample_stop_index].contiguous().view(torch.int64), 0.8)
+                v_home.mask, v_home.bitval = ibp.preprocess(v.reshape(v.shape[0], -1)[ : sample_stop_index].contiguous().view(torch.int64), 0.8)
+                k_home.bitmask = torch.zeros(math.ceil(k_home.shape[0] / 32), device=self.env.gpu.dev, dtype=torch.int32)
+                v_home.bitmask = torch.zeros(math.ceil(v_home.shape[0] / 32), device=self.env.gpu.dev, dtype=torch.int32)
         else:  # decoding
             pos = self.task.prompt_len + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
+            if self.policy.use_ibp == "validate":
+                general_copy(self.cache_dup[0], indices, k_new, None)
+                general_copy(self.cache_dup[1], indices, v_new, None)
+            if self.policy.use_ibp and self.policy.use_ibp != "transfer":
+                if 'pos' in locals():
+                    start = (pos - k.shape[0]) // 32
+                    end = k.shape[0] // 32
+                else:
+                    start = 0
+                    end = k.shape[0] // 32
+                k2 = k.reshape(-1, k.shape[1] * k.shape[2]).view(torch.int64)
+                v2 = v.reshape(-1, v.shape[1] * v.shape[2]).view(torch.int64)
+                k_home.bitmask[start:start + end] = ibp.compress_inplace(k2, k_home.mask, k_home.bitval)
+                v_home.bitmask[start:start + end] = ibp.compress_inplace(v2, v_home.mask, v_home.bitval)
+                k_new.data = k2.view(torch.float16).reshape(k.shape)
+                v_new.data = v2.view(torch.float16).reshape(v.shape)
+                #if self.policy.use_ibp == "validate":
+                #    test = ibp.decompress_fetch(k.reshape(-1, k.shape[2]).view(torch.int64), k_home.mask, k_home.bitval, k_home.bitmask[start:start + end])
+                #    torch.testing.assert_close(self.prefetch_kv.data[0, :prefetch_idx.shape[0]].to(dst.dev), test)
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
@@ -1224,7 +1282,8 @@ def run_flexgen(args):
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+                                      group_dim=2, symmetric=False),
+                    args.ibp)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
@@ -1243,6 +1302,16 @@ def run_flexgen(args):
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
+    
+    if 1:
+        prompts = tokenizer.batch_decode(inputs, skip_special_tokens=True)
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        show_str = "Outputs:\n" + 70 * '-' + "\n"
+        for i in [0]:
+            show_str += f"Prompt: {' '.join(prompts[i].split())}\n"
+            show_str += f"Output: {' '.join(outputs[i][len(prompts[i]):].split())}\n"
+            show_str += "-" * 70 + "\n"
+        print(show_str)
 
     # Log output
     prefill_latency = costs[0]
@@ -1267,7 +1336,7 @@ def run_flexgen(args):
     #    print("FlexGen")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    framework = "FlexGen + INT4" if args.compress_cache else "FlexGen"
+    framework = "FlexGen + IBP" if args.ibp else "FlexGen"
     print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
           f"Cache time: {(model.load_time + model.store_time) / 1000:.2f} (load {model.load_time / 1000:.2f}, store {model.store_time / 1000:.2f})")
     print("=================================================")
@@ -1315,6 +1384,7 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--ibp", type=str, default="")
 
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)
