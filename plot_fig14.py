@@ -42,6 +42,13 @@ def main():
     n_models = len(models)
     n_systems = len(systems)
 
+    for model in models:
+        print(model, "\t", "Cache time (s)", "\t", "Inference time (s)")
+        for system in systems:
+            print(system, "\t", results[model][system][0], "\t", results[model][system][1] - results[model][system][0])
+        print()
+    print()
+
     bar_height = 0.35
     spacing = 0.5
     group_height = n_systems * bar_height
