@@ -813,6 +813,7 @@ class OptLM:
         self.load_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
         self.store_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
         self.store_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.prefetch_time_layer = [0 for _ in range(num_layers)]
         self.prefetch_time = 0
         self.load_time = 0
         self.store_time = 0
@@ -1172,10 +1173,14 @@ class OptLM:
                         self.prefetch_evt.record()
                     self.prefetch_end[j][k].record()
                 if j > 1:
-                    self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[j - 1], self.prefetch_end[j - 1])])
+                    if j - 1 in self.attn_layer[1:-1] and (i > 0):
+                        self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[j - 1], self.prefetch_end[j - 1])])
+                        self.prefetch_time_layer[j - 1] += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[j - 1], self.prefetch_end[j - 1])])
                     self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
                     self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[j - 1], self.store_end[j - 1])])
-            self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[self.num_layers - 1], self.prefetch_end[self.num_layers - 1])])
+            if self.num_layers - 1 in self.attn_layer[1:-1] and (i > 0):
+                self.prefetch_time += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[self.num_layers - 1], self.prefetch_end[self.num_layers - 1])])
+                self.prefetch_time_layer[self.num_layers - 1] += sum([start.elapsed_time(end) for start, end in zip(self.prefetch_start[self.num_layers - 1], self.prefetch_end[self.num_layers - 1])])
             self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
             self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[self.num_layers - 1], self.store_end[self.num_layers - 1])])
             timers("generate").stop()
@@ -1517,6 +1522,11 @@ def run_flexgen(args):
     framework = "InfiniGen + IBP" if args.ibp else "InfiniGen"
     print(f"{framework}: Model: {args.model} Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
           f"Cache time: {(model.load_time + model.store_time + model.prefetch_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f} prefetch: {model.prefetch_time / 1000:.2f})")
+    print("+++++++++++++++++++++++++++++++++++++++++++++++++")
+    print("Layerwise prefetch time:")
+    for i, t in enumerate(model.prefetch_time_layer):
+        if t > 0:
+            print(f"Layer {i}: {t} us")
     print("=================================================")
 
 def add_parser_arguments(parser):
