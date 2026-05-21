@@ -12,6 +12,7 @@ import shutil
 
 import numpy as np
 from tqdm import tqdm
+import torch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,7 +65,7 @@ class GemmaConfig:
     vocab_size: int = 256000
     layer_norm_eps: float = 0.000001
     pad_token_id: int = 0
-    dtype: type = np.float16
+    dtype: type = torch.bfloat16
     prompt_len: int = 0  # The length of the prompt
     head_dim: int = 256  # The dimension of each attention head
     intermediate_size: int = 24576
@@ -306,8 +307,10 @@ def download_opt_weights(model_name, path):
             with open(param_path, "wb") as f:
                 # Numpy does not support bfloat16
                 if param.dtype == torch.bfloat16:
-                    param = param.to(torch.float16)
-                np.save(f, param.cpu().detach().numpy())
+                    torch.save(param.cpu().detach(), f)
+                else:
+                    np.save(f, param.cpu().detach().numpy())
+
 
             # shared embedding
             if "decoder.embed_tokens.weight" in name:

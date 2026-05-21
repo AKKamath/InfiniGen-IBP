@@ -28,6 +28,31 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+def RMSNorm(x, weight):
+    eps = 1e-6
+    add_unit_offset = True
+
+    _norm = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+
+    # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
+    # See https://github.com/huggingface/transformers/pull/29402
+    output = _norm
+    if add_unit_offset:
+        output = output * (1 + weight.float())
+    else:
+        output = output * weight.float()
+    return output.type_as(x)
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Applies the rotary embedding to the query and key tensors."""
+    x_ = torch.view_as_complex(
+        torch.stack(torch.chunk(x.transpose(1, 2).float(), 2, dim=-1),
+                    dim=-1))
+    x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
+    x_out = torch.cat(torch.chunk(x_out, 2, dim=-1), dim=-2)
+    x_out = x_out.reshape(x_out.shape[0], x_out.shape[1], x_out.shape[2],
+                          -1).transpose(1, 2)
+    return x_out
 
 class DeviceType(Enum):
     CPU = auto()
@@ -124,6 +149,24 @@ class TorchTensor:
         else:
             self.load_from_np(np.load(filename))
 
+    def load_from_torch(self, torch_tensor):
+        if self.device.device_type == DeviceType.DISK:
+            torch_tensor = torch_tensor.cpu()
+            with open(self.data, "wb") as fout:
+                torch.save(fout, torch_tensor)
+        else:
+            if self.device.device_type == DeviceType.COMPRESSED:
+                torch_tensor = global_cpu_device.compressed_device.compress(torch_tensor, self.data[2])
+                general_copy(self, None, torch_tensor, None)
+            else:
+                self.data.copy_(torch_tensor)
+
+    def load_from_torch_file(self, filename):
+        if self.device.device_type == DeviceType.DISK:
+            shutil.copy(filename, self.data)
+        else:
+            self.load_from_torch(torch.load(filename))
+
     def copy(self, dst, src_indices=None):
         if src_indices:
             assert all(x.step is None for x in src_indices)
@@ -132,10 +175,13 @@ class TorchTensor:
         else:
             shape = self.shape
 
+        if isinstance(self.dtype, np.dtype):
+            self.dtype = torch_dtype_to_np_dtype[self.dtype]
+
         if dst.device_type == DeviceType.COMPRESSED:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
+            ret = dst.allocate(shape, self.dtype, self.data[2])
         else:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
+            ret = dst.allocate(shape, self.dtype)
         general_copy(ret, None, self, src_indices)
         return ret
 
@@ -186,7 +232,8 @@ class TorchDevice:
             pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
-        dtype = np_dtype_to_torch_dtype[dtype]
+        if not isinstance(dtype, torch.dtype):
+            dtype = np_dtype_to_torch_dtype[dtype]
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name=name)
 
@@ -284,14 +331,70 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
+    def gemma_input_embed(self, inputs, w_token, pad_token_id, donate):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        token_ids = inputs.data
+        if donate[0]: inputs.delete()
+
+        # token embedding
+        token_embed = F.embedding(token_ids, w_token.data)
+        #print("Input embedding", token_ids[0], w_token.data[0], token_embed[0])
+        normalizer = torch.tensor(token_embed.shape[2]**0.5, dtype=token_embed.dtype, device=token_embed.device)
+        token_embed = token_embed * normalizer
+        return TorchTensor.create_from_torch(token_embed, self)
+
+    def gemma_output_embed(self, inputs, w_ln, w_token, donate,
+                         sampler, output_positions, temperatures, top_ps, top_ks):
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        hidden = RMSNorm(inputs.data, w_ln.data)
+        #print("Normed output", hidden[0])
+
+        embedder_weight = w_token.data
+        #print("params", embedder_weight, hidden, output_positions, temperatures, top_ps, top_ks)
+        next_tokens, logits = sampler.forward(
+                embedding=embedder_weight,
+                hidden_states=hidden,
+                output_positions=output_positions,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                top_ks=top_ks,
+            )
+        return TorchTensor.create_from_torch(next_tokens, self)
+
+        b, s, h = inputs.shape
+
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        if donate[0]: inputs.delete()
+
+        # output embedding
+        logits = F.linear(hidden, w_token.data)
+        last_token_logits = logits[:,-1,:]
+
+        if do_sample and not temperature < 1e-5:
+            probs = torch.softmax(last_token_logits / temperature, dim=-1)
+            ids = torch.multinomial(probs, num_samples=1)
+        else:
+            ids = last_token_logits.argmax(dim=1, keepdim=True)
+        return TorchTensor.create_from_torch(next_tokens, self)
+
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        if hasattr(config, 'head_dim'):
+            head_dim = config.head_dim
+        else:
+            head_dim = hidden_size // num_head
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
         pin_memory = True
-        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        k_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, config.dtype, pin_memory=pin_memory)
         return k_cache, v_cache
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
@@ -468,14 +571,169 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new
 
+    def gemma_mha(self, inputs, attention_mask, w_qkv, w_out, w_ln, freqs_cis,
+                  n_head, n_head_kv, head_dim, donate, compress_cache, comp_config):
+        """Multi-head attention (prefill phase)."""
+        # decompress weights
+        if w_qkv.device.device_type == DeviceType.COMPRESSED:
+            w_qkv = w_qkv.device.decompress(w_qkv)
+            w_out = w_out.device.decompress(w_out)
+
+        b, s, h = inputs.shape
+        residual = inputs.data
+        scaling = head_dim ** -0.5
+
+        hidden = RMSNorm(inputs.data, weight=w_ln.data)
+
+        qkv = F.linear(hidden, w_qkv.data, bias=None)  # shape: (b, s, h + h + h)
+
+        q_size = n_head * head_dim
+        kv_size = n_head_kv * head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size],
+                               dim=-1)
+
+        # shape: (b, s, n_head, head_dim)
+        q = q.view(b, s, n_head, head_dim)
+        k = k.view(b, s, n_head_kv, head_dim)
+        v = v.view(b, s, n_head_kv, head_dim)
+
+        # Positional embedding.
+        q = apply_rotary_emb(q, freqs_cis=freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis=freqs_cis)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        q = q.transpose(1, 2)
+        # [batch_size, n_local_heads, max_seq_len, head_dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # [batch_size, n_local_heads, input_len, max_seq_len]
+        q.mul_(scaling)
+        scores = torch.matmul(q, k.transpose(2, 3))
+
+        scores = scores + attention_mask
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        value = torch.matmul(scores, v)
+
+        # [batch_size, input_len, hidden_dim]
+        value = (value.transpose(1, 2).contiguous().view(
+            b, s, -1))
+        value = F.linear(value, w_out.data, bias=None)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        # (b * n_head, s, head_dim)
+        k = k.reshape(b * n_head, s, head_dim)
+        v = v.reshape(b * n_head, s, head_dim)
+        # (s, b * n_head, head_dim)
+        k = k.permute(1, 0, 2)
+        v = v.permute(1, 0, 2)
+
+        if compress_cache:
+            k = self.compressed_device.compress(k, comp_config)
+            v = self.compressed_device.compress(v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(k, self)
+            v = TorchTensor.create_from_torch(v, self)
+
+        return TorchTensor.create_from_torch(value + residual, self), k, v, w_qkv
+
+
+    def gemma_mha_gen(self, inputs, mask_len, w_qkv, w_out, w_ln, freqs_cis, n_head, n_head_kv, head_dim,
+                 k_cache, v_cache, donate, attn_sparsity, compress_cache, comp_config):
+        """Multi-head attention (decoding phase)."""
+        # decompress weights
+        if w_qkv.device.device_type == DeviceType.COMPRESSED:
+            w_qkv = w_qkv.device.decompress(w_qkv)
+            w_out = w_out.device.decompress(w_out)
+
+        b, tgt_s, h = inputs.shape
+        residual = inputs.data
+        src_s = min(mask_len, k_cache.shape[0] + 1)
+        scaling = head_dim ** -0.5
+
+        hidden = RMSNorm(inputs.data, weight=w_ln.data)
+        qkv = F.linear(hidden, w_qkv.data, bias=None)  # shape: (b, s, h + h + h)
+
+        q_size = n_head * head_dim
+        kv_size = n_head_kv * head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size],
+                               dim=-1)
+
+        print("qkv type", qkv.dtype, q.dtype, k.dtype, v.dtype, flush=True)
+
+        # shape: (b, s, n_head, head_dim)
+        q = q.view(b, tgt_s, n_head, head_dim)
+        k = k.view(b, tgt_s, n_head_kv, head_dim)
+        v = v.view(b, tgt_s, n_head_kv, head_dim)
+        print("qkv dtype", q.dtype, k.dtype, v.dtype, flush=True)
+
+        # Positional embedding.
+        q = apply_rotary_emb(q, freqs_cis=freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis=freqs_cis)
+        print(q.dtype, k.dtype, flush=True)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        q = q.transpose(1, 2)
+        # [batch_size, n_local_heads, input_len, head_dim]
+        k_new = k.transpose(1, 2)
+        v_new = v.transpose(1, 2)
+        print("qkv dtype2", q.dtype, k.dtype, v.dtype, flush=True)
+
+        # shape: (s, b * n_head, head_dim)
+        k = k_cache.data[:src_s]
+        v = v_cache.data[:src_s]
+        print("qkv dtype2.5", q.dtype, k.dtype, flush=True)
+        # shape: (b, n_head, s, head_dim)
+        k = k.transpose(0, 1).reshape(b, n_head, -1, head_dim)
+        v = v.transpose(0, 1).reshape(b, n_head, -1, head_dim)
+        print("qkv dtype2.75", q.dtype, k.dtype, k_new.dtype, flush=True)
+        #print("post shape", v.shape, k.shape)
+        k  = torch.cat((k, k_new), dim = 2)
+        v  = torch.cat((v, v_new), dim = 2)
+        #print("v cat_shape", v.shape, k.shape)
+
+        # [batch_size, n_local_heads, input_len, max_seq_len]
+        print("qkv dtype3", q.dtype, k.dtype, flush=True)
+        q.mul_(scaling)
+        print("qkv dtype4", q.dtype, k.dtype, flush=True)
+        scores = torch.matmul(q, k.transpose(2, 3))
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        output = torch.matmul(scores, v)
+
+        # [batch_size, input_len, hidden_dim]
+        output = (output.transpose(1, 2).contiguous().view(
+            b, tgt_s, -1))
+        value = F.linear(output, w_out.data, bias=None)
+
+        # shape: (1, b * n_head, head_dim)
+        k_new = k_new.permute(2, 0, 1, 3).reshape(tgt_s, b * n_head, head_dim)
+        # shape: (1, b * n_head, head_dim)
+        v_new = v_new.permute(2, 0, 1, 3).reshape(tgt_s, b * n_head, head_dim)
+
+        if donate[0]: inputs.delete()
+        #if donate[1]: attention_mask.delete()
+
+        k_new = TorchTensor.create_from_torch(k_new, self)
+        v_new = TorchTensor.create_from_torch(v_new, self)
+
+        return TorchTensor.create_from_torch(value + residual, self), k_new, v_new
+
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
         # shape: (b * n_head, 1, s)
         attn_weights = torch.bmm(q, k)
         # shape: (b, 1, 1, s)
-        mask = mask.view(b, 1, 1, src_s)
+        if mask is not None:
+            mask = mask.view(b, 1, 1, src_s)
         # shape: (b * n_head, 1, s)
         attn_weights = attn_weights.view(b, n_head, 1, src_s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        if mask is not None:
+            attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
@@ -583,6 +841,22 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         return TorchTensor.create_from_torch(out, self)
 
+    def gemma_mlp(self, inputs, w_gate, w_up, w_down, w_pln, donate):
+        if w_gate.device.device_type == DeviceType.COMPRESSED:
+            w_gate = w_gate.device.decompress(w_gate)
+            w_up = w_up.device.decompress(w_up)
+            w_down = w_down.device.decompress(w_down)
+
+        residual = inputs.data
+        out = RMSNorm(inputs.data, w_pln.data)
+        gate = F.linear(out, w_gate.data)
+        gate = F.gelu(gate, approximate="tanh")
+        up = F.linear(out, w_up.data)
+        fuse = gate * up
+        out = F.linear(fuse, w_down.data)
+        if donate[0]: inputs.delete()
+        return TorchTensor.create_from_torch(out + residual, self)
+
     def synchronize(self):
         torch.cuda.synchronize()
 
@@ -657,7 +931,11 @@ class TorchDisk:
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
-        return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
+        if isinstance(dtype, np.dtype):
+            torch_dtype = np_dtype_to_torch_dtype[dtype]
+        else:
+            torch_dtype = dtype
+        return TorchTensor(shape, torch_dtype,
                            path, self, name=name)
 
     def delete(self, tensor):
@@ -668,9 +946,13 @@ class TorchDisk:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        if config.head_dim is not None:
+            head_dim = config.head_dim
+        else:
+            head_dim = hidden_size // num_head
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, head_dim)
+        k_cache = self.allocate(shape, config.dtype)
+        v_cache = self.allocate(shape, config.dtype)
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -753,9 +1035,9 @@ class TorchMixedDevice:
         lens = [len_gpu, len_cpu, len_disk]
 
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16,
+        k_cache = self.allocate(shape, config.dtype,
             seg_lengths=lens, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16,
+        v_cache = self.allocate(shape, config.dtype,
             seg_lengths=lens, pin_memory=pin_memory)
         return k_cache, v_cache
 
@@ -846,7 +1128,7 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         # The cpu tensor is not pinned, use pin_memory as a relay
         src = src.data[src_indices] if src_indices else src.data
         dst = dst.data[dst_indices] if dst_indices else dst.data
-        #src = src.pin_memory()
+        src = src.pin_memory()
         dst.copy_(src, non_blocking=True)
     else:
         # The normal path

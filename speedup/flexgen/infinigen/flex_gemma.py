@@ -1494,6 +1494,8 @@ def run_flexgen(args):
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     elif args.model == "google/gemma-7b-pytorch":
         tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b-pytorch", padding_side="left")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
