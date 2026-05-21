@@ -3,3 +3,6 @@
 *.log
 *.pdf
 **.nsys-rep
+speedup/flexgen/flexgen/flex_gemma.py
+speedup/flexgen/flexgen/flex_opt.py
+speedup/flexgen/flexgen/pytorch_backend.py
