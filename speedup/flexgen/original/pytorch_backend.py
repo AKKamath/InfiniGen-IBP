@@ -663,43 +663,37 @@ class TorchDevice:
         q, k, v = qkv.split([q_size, kv_size, kv_size],
                                dim=-1)
 
-        print("qkv type", qkv.dtype, q.dtype, k.dtype, v.dtype, flush=True)
-
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, tgt_s, n_head, head_dim)
         k = k.view(b, tgt_s, n_head_kv, head_dim)
         v = v.view(b, tgt_s, n_head_kv, head_dim)
-        print("qkv dtype", q.dtype, k.dtype, v.dtype, flush=True)
 
         # Positional embedding.
         q = apply_rotary_emb(q, freqs_cis=freqs_cis)
         k = apply_rotary_emb(k, freqs_cis=freqs_cis)
-        print(q.dtype, k.dtype, flush=True)
 
         # [batch_size, n_local_heads, input_len, head_dim]
         q = q.transpose(1, 2)
         # [batch_size, n_local_heads, input_len, head_dim]
         k_new = k.transpose(1, 2)
         v_new = v.transpose(1, 2)
-        print("qkv dtype2", q.dtype, k.dtype, v.dtype, flush=True)
 
         # shape: (s, b * n_head, head_dim)
         k = k_cache.data[:src_s]
         v = v_cache.data[:src_s]
-        print("qkv dtype2.5", q.dtype, k.dtype, flush=True)
+
         # shape: (b, n_head, s, head_dim)
         k = k.transpose(0, 1).reshape(b, n_head, -1, head_dim)
         v = v.transpose(0, 1).reshape(b, n_head, -1, head_dim)
-        print("qkv dtype2.75", q.dtype, k.dtype, k_new.dtype, flush=True)
+
         #print("post shape", v.shape, k.shape)
         k  = torch.cat((k, k_new), dim = 2)
         v  = torch.cat((v, v_new), dim = 2)
         #print("v cat_shape", v.shape, k.shape)
 
         # [batch_size, n_local_heads, input_len, max_seq_len]
-        print("qkv dtype3", q.dtype, k.dtype, flush=True)
         q.mul_(scaling)
-        print("qkv dtype4", q.dtype, k.dtype, flush=True)
+
         scores = torch.matmul(q, k.transpose(2, 3))
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
 

@@ -1362,7 +1362,7 @@ def run_flexgen(args):
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="/mnt/storage/akkamath/opt_weights",
+    parser.add_argument("--path", type=str, default="~/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir",
