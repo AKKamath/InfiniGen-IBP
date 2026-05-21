@@ -13,7 +13,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "torch>=1.12", "transformers==4.24",
+    "torch>=1.12", "transformers>=4.38,<4.50",
     "numpy<2", "tqdm", "pulp", "attrs",
 ]
 
