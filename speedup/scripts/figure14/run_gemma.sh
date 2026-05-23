@@ -33,7 +33,7 @@ do
     then
       CMD=$CMD" --percent 70 30 0 100 100 0"
     else
-      CMD=$CMD" --percent 30 70 100 0 100 0"
+      CMD=$CMD" --percent 0 100 100 0 100 0"
     fi
     if [ "$SCHEME" = "int4" ]
     then
