@@ -14,6 +14,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
+import ibp
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
@@ -65,6 +66,8 @@ class Policy:
     # Compress KV cache with group-wise quantization
     compress_cache: bool
     comp_cache_config: CompressionConfig
+
+    use_ibp: str
 
     @property
     def w_disk_percent(self):
@@ -185,6 +188,12 @@ def init_weight_list(weight_specs, policy, env):
             else:
                 weight.load_from_np(np.ones(shape, dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
+
+            if home == env.cpu and policy.use_ibp:
+                # Only compress 2D tensors.
+                if len(weight.data.shape) > 1:
+                    weight.ibp_preprocess()
+                    weight.ibp_compress()
         else:
             weight = home.compressed_device.allocate(
                 shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
@@ -698,6 +707,11 @@ class GemmaLM:
         self.load_time = 0
         self.store_time = 0
 
+        # For weights
+        self.load_w_start = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_w_end = [[torch.cuda.Event(enable_timing=True) for _ in range(num_gpu_batches)] for _ in range(num_layers)]
+        self.load_w_time = 0
+
         # cache[j][k]
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
@@ -735,9 +749,13 @@ class GemmaLM:
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
+                self.load_w_start[j][k].record()
                 self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+                self.load_w_end[j][k].record()
         else:
+            self.load_w_start[j][k].record()
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+            self.load_w_end[j][k].record()
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -1015,8 +1033,10 @@ class GemmaLM:
                 if j > 1:
                     self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[j - 1], self.store_end[j - 1])])
                     self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[j - 1], self.load_end[j - 1])])
+                    self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[j - 1], self.load_w_end[j - 1])])
             self.store_time += sum([start.elapsed_time(end) for start, end in zip(self.store_start[self.num_layers - 1], self.store_end[self.num_layers - 1])])
             self.load_time += sum([start.elapsed_time(end) for start, end in zip(self.load_start[self.num_layers - 1], self.load_end[self.num_layers - 1])])
+            self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[self.num_layers - 1], self.load_w_end[self.num_layers - 1])])
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
@@ -1119,6 +1139,9 @@ class GemmaLM:
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
+                if j > 1:
+                    self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[j - 1], self.load_w_end[j - 1])])
+            self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[self.num_layers - 1], self.load_w_end[self.num_layers - 1])])
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
@@ -1145,6 +1168,9 @@ class GemmaLM:
                     self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
                     self.sync()
+                if j > 1:
+                    self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[j - 1], self.load_w_end[j - 1])])
+            self.load_w_time += sum([start.elapsed_time(end) for start, end in zip(self.load_w_start[self.num_layers - 1], self.load_w_end[self.num_layers - 1])])
             timers("generate").stop()
 
         # Epilogue
@@ -1303,7 +1329,8 @@ def run_flexgen(args):
                                       group_dim=0, symmetric=False),
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+                                      group_dim=2, symmetric=False),
+                    args.ibp)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
@@ -1326,8 +1353,7 @@ def run_flexgen(args):
     if 1:
         prompts = tokenizer.batch_decode(inputs, skip_special_tokens=True)
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        print(output_ids[0][len(inputs[0]):], len(output_ids[0]), len(prompts[0]))
-        show_str = "Outputs:\n" + 70 * '-' + "\n"
+        show_str = 70 * '-' + "\n"
         for i in [0]:
             show_str += f"Prompt: {' '.join(prompts[i].split())}\n"
             show_str += f"Output: {' '.join(outputs[i][len(prompts[i]):].split())}\n"
@@ -1351,12 +1377,16 @@ def run_flexgen(args):
     projected = bool(args.debug_mode or cut_gen_len)
 
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    print("FlexGen")
+    if args.ibp:
+        print(f"FlexGen + IBP ({args.ibp})")
+    else:
+        print("FlexGen")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
-    framework = "FlexGen"
-    print(f"{framework}: Total: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f} " +
-          f"Cache time: {(model.load_time + model.store_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f})")
+    framework = "FlexGen + IBP" if args.ibp else "FlexGen"
+    print(f"{framework}: \nTotal: {total_latency:.3f} Prefill: {prefill_latency:.3f} Decode: {decode_latency:.3f}\n" +
+          f"Cache time: {(model.load_time + model.store_time) / 1000:.2f} (load: {model.load_time / 1000:.2f} store: {model.store_time / 1000:.2f})\n" +
+          f"Weight load time: {model.load_w_time / 1000:.2f}")
     print("=================================================")
 
 def add_parser_arguments(parser):
@@ -1405,6 +1435,7 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)
+    parser.add_argument("--ibp", type=str, default=None)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

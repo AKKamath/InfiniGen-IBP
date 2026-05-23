@@ -1,10 +1,9 @@
 TYPE="flex_gemma"
-MODEL_LIST="google/gemma-7b-pytorch"
 
 FLEXGEN_PATH=$PWD/../../flexgen
-for MODEL in $MODEL_LIST
+for MODEL in "google/gemma-7b-pytorch"
 do
-  for SCHEME in "original" # #"original" #"infinigen" #"ibp_compress" #"original" "flex-ibp" # #"ibp" "ibp_compress" #"infinigen" #"ibp" "ibp_compress" "infinigen"
+  for SCHEME in "original" "flex-ibp"
   do
     rm $FLEXGEN_PATH/flexgen/flex_opt.py
     rm $FLEXGEN_PATH/flexgen/flex_gemma.py
@@ -29,12 +28,12 @@ do
       ln -s ../$SCHEME/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
     fi
 
-    CMD="--model ${MODEL} --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 128 --gen-len 20 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
+    CMD="--model ${MODEL} --overlap true --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 128 --gen-len 20 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
     if [ "$MODEL" = "facebook/opt-30b" ]
     then
       CMD=$CMD" --percent 70 30 0 100 100 0"
     else
-      CMD=$CMD" --percent 100 0 0 100 100 0"
+      CMD=$CMD" --percent 30 70 100 0 100 0"
     fi
     if [ "$SCHEME" = "int4" ]
     then

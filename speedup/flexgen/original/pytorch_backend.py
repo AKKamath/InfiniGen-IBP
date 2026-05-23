@@ -12,6 +12,7 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
+import ibp
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -148,6 +149,21 @@ class TorchTensor:
             shutil.copy(filename, self.data)
         else:
             self.load_from_np(np.load(filename))
+
+    def ibp_preprocess(self):
+        if self.data.shape[0] % 8 != 0:
+            self.mask, self.bitval = ibp.preprocess(self.data.view(torch.int64))
+        else:
+            # We pack 8 tensors to improve the decompression throughput for large tensors
+            self.mask, self.bitval = ibp.preprocess(self.data.view(self.data.shape[0] // 8, -1).view(torch.int64))
+
+    def ibp_compress(self):
+        if self.data.shape[0] % 8 != 0:
+            self.bitmask = ibp.compress_inplace(self.data.view(torch.int64), self.mask, self.bitval)
+            self.comp_len = ibp.get_single_compress_len(self.data.view(torch.int64), self.mask, self.bitval)
+        else:
+            self.bitmask = ibp.compress_inplace(self.data.view(self.data.shape[0] // 8, -1).view(torch.int64), self.mask, self.bitval)
+            self.comp_len = ibp.get_single_compress_len(self.data.view(self.data.shape[0] // 8, -1).view(torch.int64), self.mask, self.bitval)
 
     def load_from_torch(self, torch_tensor):
         if self.device.device_type == DeviceType.DISK:
@@ -1126,9 +1142,24 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         dst.copy_(src, non_blocking=True)
     else:
         # The normal path
-        src = src.data[src_indices] if src_indices else src.data
-        dst = dst.data[dst_indices] if dst_indices else dst.data
-        dst.copy_(src, non_blocking=True)
+        src_tensor = src.data[src_indices] if src_indices else src.data
+        dst_tensor = dst.data[dst_indices] if dst_indices else dst.data
+        # This is IBP compressed. Let's decompress first.
+        if (src.device.device_type == DeviceType.CPU and
+            dst.device.device_type == DeviceType.CUDA and
+            hasattr(src, 'mask')):
+            if(src_indices is not None or dst_indices is not None):
+                raise NotImplementedError("Partial copy is not supported for IBP compressed tensors.")
+            if src.data.shape[0] % 8 != 0:
+                ibp.decompress_fetch(src.data.view(torch.int64), src.mask, src.bitval,
+                                    src.bitmask, dst.device.dev, output_tensor=dst_tensor.view(torch.int64),
+                                    comp_len=src.comp_len)
+            else:
+                ibp.decompress_fetch(src.data.view(src.data.shape[0] // 8, -1).view(torch.int64), src.mask, src.bitval,
+                                    src.bitmask, dst.device.dev, output_tensor=dst_tensor.view(src.data.shape[0] // 8, -1).view(torch.int64),
+                                    comp_len=src.comp_len)
+        else:
+            dst_tensor.copy_(src_tensor, non_blocking=True)
 
 
 def cut_indices(indices, start, stop, base=0):
