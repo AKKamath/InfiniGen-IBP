@@ -16,3 +16,6 @@ run_live_expt:
 	pushd speedup/scripts/figure14/ && \
 	sh run.sh; \
 	popd;
+
+run_flexgen:
+	cd speedup/scripts/figure14/; bash run_gemma.sh
