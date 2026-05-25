@@ -1153,11 +1153,11 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
             if src.data.shape[0] % 8 != 0:
                 ibp.decompress_fetch(src.data.view(torch.int64), src.mask, src.bitval,
                                     src.bitmask, dst.device.dev, output_tensor=dst_tensor.view(torch.int64),
-                                    comp_len=src.comp_len)
+                                    comp_len=src.comp_len, nblks=64)
             else:
                 ibp.decompress_fetch(src.data.view(src.data.shape[0] // 8, -1).view(torch.int64), src.mask, src.bitval,
                                     src.bitmask, dst.device.dev, output_tensor=dst_tensor.view(src.data.shape[0] // 8, -1).view(torch.int64),
-                                    comp_len=src.comp_len)
+                                    comp_len=src.comp_len, nblks=64)
         else:
             dst_tensor.copy_(src_tensor, non_blocking=True)
 
