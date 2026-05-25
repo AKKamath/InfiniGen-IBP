@@ -3,7 +3,7 @@ TYPE="flex_gemma"
 FLEXGEN_PATH=$PWD/../../flexgen
 for MODEL in "google/gemma-7b-pytorch"
 do
-  for SCHEME in "original" "flex-ibp"
+  for SCHEME in "flex-ibp" "original"
   do
     rm $FLEXGEN_PATH/flexgen/flex_opt.py
     rm $FLEXGEN_PATH/flexgen/flex_gemma.py
@@ -28,7 +28,7 @@ do
       ln -s ../$SCHEME/pytorch_backend.py $FLEXGEN_PATH/flexgen/pytorch_backend.py
     fi
 
-    CMD="--model ${MODEL} --overlap true --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 128 --gen-len 20 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
+    CMD="--model ${MODEL} --overlap true --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
     if [ "$MODEL" = "facebook/opt-30b" ]
     then
       CMD=$CMD" --percent 70 30 0 100 100 0"
